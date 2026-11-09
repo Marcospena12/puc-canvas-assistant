@@ -55,6 +55,13 @@ class CanvasService:
     async def get_files(self, course_id: int) -> list[dict[str, Any]]:
         return await self.client.get_all(f"/courses/{course_id}/files")
 
+    async def get_file(self, course_id: int, file_id: int) -> dict[str, Any]:
+        result = await self.client.get(f"/courses/{course_id}/files/{file_id}")
+        return result if isinstance(result, dict) else {}
+
+    async def get_folders(self, course_id: int) -> list[dict[str, Any]]:
+        return await self.client.get_all(f"/courses/{course_id}/folders")
+
     async def get_modules(self, course_id: int) -> list[dict[str, Any]]:
         return await self.client.get_all(
             f"/courses/{course_id}/modules",

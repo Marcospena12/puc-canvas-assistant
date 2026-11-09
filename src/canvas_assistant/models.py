@@ -88,6 +88,7 @@ class CourseFile:
     locked: bool
     url: str | None
     mime_class: str | None
+    folder_id: int | None = None
 
 
 @dataclass(slots=True)

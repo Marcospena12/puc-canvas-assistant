@@ -7,7 +7,7 @@ from datetime import timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from .canvas import CanvasError, CanvasService
+from .canvas import CanvasAuthError, CanvasError, CanvasForbiddenError, CanvasService
 from .config import UserProfile
 from .models import (
     Announcement,
@@ -19,7 +19,7 @@ from .models import (
     PlannerItem,
 )
 from .repository import Repository
-from .timeutil import local_now, parse_dt, to_utc_iso
+from .timeutil import local_now, parse_dt, to_utc_iso, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +69,7 @@ def _is_subject(course_code: str, name: str) -> bool:
     )
 
 
-def _tab_enabled(tabs: list[dict[str, Any]], tab_id: str) -> bool | None:
+def tab_enabled(tabs: list[dict[str, Any]], tab_id: str) -> bool | None:
     """True/False se a aba existe; None quando não sabemos (tabs indisponíveis)."""
     if not tabs:
         return None
@@ -80,6 +80,9 @@ def _tab_enabled(tabs: list[dict[str, Any]], tab_id: str) -> bool | None:
         if current_id == tab_id or current_label == label:
             return not bool(tab.get("hidden"))
     return False
+
+
+_tab_enabled = tab_enabled
 
 
 def parse_course(raw: dict[str, Any], tabs: list[dict[str, Any]]) -> Course:
@@ -203,6 +206,7 @@ def parse_file(raw: dict[str, Any], course_id: int) -> CourseFile:
         locked=_as_bool(raw.get("locked") or raw.get("locked_for_user")),
         url=raw.get("url"),
         mime_class=raw.get("mime_class"),
+        folder_id=_as_int(raw.get("folder_id")),
     )
 
 
@@ -281,6 +285,7 @@ class SyncService:
         past_days: int = 7,
         future_days: int = 30,
         announcements_lookback_days: int = 60,
+        file_blocked_retry_hours: int = 24,
     ) -> None:
         self.canvas = canvas
         self.repo = repo
@@ -289,6 +294,7 @@ class SyncService:
         self.past_days = past_days
         self.future_days = future_days
         self.announcements_lookback_days = announcements_lookback_days
+        self.file_blocked_retry_hours = file_blocked_retry_hours
 
     def _record_issue(self, resource: str, scope_id: int, exc: Exception) -> None:
         status = getattr(exc, "status_code", None)
@@ -355,15 +361,47 @@ class SyncService:
             except CanvasError as exc:
                 self._record_issue("announcements", course.id, exc)
 
-        if _tab_enabled(course.tabs, "files") is not False:
-            try:
-                raw = await self.canvas.get_files(course.id)
-                parsed = [parse_file(item, course.id) for item in raw]
-                self.repo.replace_files(user_id, course.id, parsed)
-                self.repo.clear_issues(user_id, "files", course.id)
-                files = len(parsed)
-            except CanvasError as exc:
-                self._record_issue("files", course.id, exc)
+        files_enabled = tab_enabled(course.tabs, "files")
+        if files_enabled is False:
+            self.repo.set_file_tab_status(user_id, course.id, "unavailable")
+        elif files_enabled is not False:
+            retry_at_str = self.repo.get_files_retry_at(user_id, course.id)
+            retry_due = True
+            if retry_at_str:
+                retry_dt = parse_dt(retry_at_str)
+                if retry_dt and retry_dt > utc_now():
+                    retry_due = False
+                    logger.info(
+                        "Arquivos do curso %s bloqueados; nova tentativa após %s",
+                        course.id,
+                        retry_at_str,
+                    )
+
+            if retry_due:
+                try:
+                    raw = await self.canvas.get_files(course.id)
+                    parsed = [parse_file(item, course.id) for item in raw]
+                    self.repo.replace_files(user_id, course.id, parsed)
+                    self.repo.clear_issues(user_id, "files", course.id)
+                    self.repo.set_file_tab_status(user_id, course.id, "ok", success=True)
+                    files = len(parsed)
+                except (CanvasAuthError, CanvasForbiddenError) as exc:
+                    now = utc_now()
+                    retry_at = to_utc_iso(now + timedelta(hours=self.file_blocked_retry_hours))
+                    status_name = (
+                        "forbidden" if isinstance(exc, CanvasForbiddenError) else "unauthorized"
+                    )
+                    self.repo.set_file_tab_status(
+                        user_id,
+                        course.id,
+                        status_name,
+                        error=str(exc),
+                        retry_at=retry_at,
+                    )
+                    self._record_issue("files", course.id, exc)
+                except CanvasError as exc:
+                    self.repo.set_file_tab_status(user_id, course.id, "error", error=str(exc))
+                    self._record_issue("files", course.id, exc)
 
         if _tab_enabled(course.tabs, "modules") is not False:
             try:

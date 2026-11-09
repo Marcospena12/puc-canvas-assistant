@@ -29,6 +29,17 @@ def _parse_clock(value: str, field: str) -> time:
     return time(hour, minute)
 
 
+def _parse_file_types(value: str) -> frozenset[str]:
+    types = {
+        part.strip().lower().lstrip(".")
+        for part in re.split(r"[,\s]+", (value or "").strip())
+        if part.strip()
+    }
+    if not types:
+        raise ValueError("FILE_ALLOWED_TYPES não pode ficar vazio")
+    return frozenset(types)
+
+
 def _parse_due_hours(value: str) -> tuple[int, ...]:
     hours: set[int] = set()
     for part in re.split(r"[,\s]+", (value or "").strip()):
@@ -61,12 +72,29 @@ class NotificationConfig:
     new_assignments: bool
     due_hours: tuple[int, ...]
     announcements: bool
+    new_files: bool
     digest: bool
     digest_time: time
     quiet_start: time
     quiet_end: time
     max_stale_minutes: int
     digest_grace_minutes: int
+
+
+@dataclass(frozen=True, slots=True)
+class FileSyncConfig:
+    enabled: bool
+    interval_minutes: int
+    files_dir: Path
+    max_size_mb: int
+    allowed_types: frozenset[str]
+    blocked_retry_hours: int
+    download_retry_hours: int
+    download_timeout_seconds: int
+
+    @property
+    def max_size_bytes(self) -> int:
+        return self.max_size_mb * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,6 +139,7 @@ class Settings(BaseSettings):
     notify_new_assignments: bool = True
     notify_due_hours: str = "24,2"
     notify_announcements: bool = True
+    notify_new_files: bool = True
     notify_digest: bool = True
     notify_digest_time: str = "08:00"
     notify_quiet_start: str = "22:00"
@@ -120,6 +149,14 @@ class Settings(BaseSettings):
     notify_digest_grace_minutes: int = Field(default=120, ge=0, le=720)
 
     db_path: Path = Path("data/assistant.sqlite3")
+    file_sync_enabled: bool = True
+    file_sync_interval_minutes: int = Field(default=60, ge=5, le=1440)
+    files_dir: Path = Path("data/files")
+    file_max_size_mb: int = Field(default=50, ge=1, le=1024)
+    file_allowed_types: str = "pdf,pptx,docx,txt,md"
+    file_blocked_retry_hours: int = Field(default=24, ge=1, le=168)
+    file_download_retry_hours: int = Field(default=6, ge=1, le=168)
+    file_download_timeout_seconds: int = Field(default=120, ge=10, le=900)
     timezone: str = "America/Sao_Paulo"
     poll_interval_minutes: int = Field(default=20, ge=5, le=240)
     sync_past_days: int = Field(default=7, ge=0, le=60)
@@ -168,12 +205,26 @@ class Settings(BaseSettings):
             new_assignments=self.notify_new_assignments,
             due_hours=_parse_due_hours(self.notify_due_hours),
             announcements=self.notify_announcements,
+            new_files=self.notify_new_files,
             digest=self.notify_digest,
             digest_time=_parse_clock(self.notify_digest_time, "NOTIFY_DIGEST_TIME"),
             quiet_start=_parse_clock(self.notify_quiet_start, "NOTIFY_QUIET_START"),
             quiet_end=_parse_clock(self.notify_quiet_end, "NOTIFY_QUIET_END"),
             max_stale_minutes=self.notify_max_stale_minutes,
             digest_grace_minutes=self.notify_digest_grace_minutes,
+        )
+
+    @property
+    def file_sync(self) -> FileSyncConfig:
+        return FileSyncConfig(
+            enabled=self.file_sync_enabled,
+            interval_minutes=self.file_sync_interval_minutes,
+            files_dir=self.files_dir,
+            max_size_mb=self.file_max_size_mb,
+            allowed_types=_parse_file_types(self.file_allowed_types),
+            blocked_retry_hours=self.file_blocked_retry_hours,
+            download_retry_hours=self.file_download_retry_hours,
+            download_timeout_seconds=self.file_download_timeout_seconds,
         )
 
     @property

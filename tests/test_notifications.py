@@ -16,6 +16,7 @@ def make_config(**overrides) -> NotificationConfig:
         "new_assignments": True,
         "due_hours": (24, 2),
         "announcements": True,
+        "new_files": True,
         "digest": True,
         "digest_time": time(8, 0),
         "quiet_start": time(22, 0),

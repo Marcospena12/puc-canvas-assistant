@@ -32,6 +32,7 @@ def make_channel(**overrides) -> TelegramChannel:
         "on_message": _dummy_message,
         "on_sync": _dummy_sync,
         "on_status": _dummy_sync,
+        "on_files": _dummy_message,
     }
     data.update(overrides)
     return TelegramChannel(**data)

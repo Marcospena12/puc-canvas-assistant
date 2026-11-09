@@ -19,6 +19,7 @@ logger = logging.getLogger(__name__)
 DUE_EVENT_PREFIX = "due"
 SYNC_META_PREFIX = "notify_last_sync"
 BASELINE_META_PREFIX = "notify_baseline"
+FILES_BASELINE_META_PREFIX = "notify_files_baseline"
 ENABLED_META_PREFIX = "notify_enabled_state"
 
 
@@ -58,6 +59,10 @@ def _sync_meta_key(user_id: str) -> str:
 
 def _baseline_meta_key(user_id: str) -> str:
     return f"{BASELINE_META_PREFIX}:{user_id}"
+
+
+def _files_baseline_meta_key(user_id: str) -> str:
+    return f"{FILES_BASELINE_META_PREFIX}:{user_id}"
 
 
 def _enabled_meta_key(user_id: str) -> str:
@@ -101,6 +106,7 @@ class NotificationService:
         user_id = self.user.user_id
         assignment_ids = self.repo.list_assignment_ids(user_id)
         announcement_ids = self.repo.list_announcement_ids(user_id)
+        file_ids = self.repo.list_file_ids(user_id)
         events = [
             _event(f"new_assignment:{assignment_id}", "baseline", assignment_id)
             for assignment_id in assignment_ids
@@ -109,13 +115,28 @@ class NotificationService:
             _event(f"new_announcement:{announcement_id}", "baseline", announcement_id)
             for announcement_id in announcement_ids
         )
+        events.extend(_event(f"new_file:{file_id}", "baseline", file_id) for file_id in file_ids)
         self.repo.add_notification_events(user_id, events)
         self.repo.set_meta(_baseline_meta_key(user_id), to_utc_iso(now))
+        self.repo.set_meta(_files_baseline_meta_key(user_id), "1")
         logger.info(
-            "Baseline de notificações: %s tarefas e %s avisos",
+            "Baseline de notificações: %s tarefas, %s avisos e %s arquivos",
             len(assignment_ids),
             len(announcement_ids),
+            len(file_ids),
         )
+
+    def ensure_files_baseline(self) -> None:
+        user_id = self.user.user_id
+        key = _files_baseline_meta_key(user_id)
+        if self.repo.get_meta(key) == "1":
+            return
+        file_ids = self.repo.list_file_ids(user_id)
+        events = [_event(f"new_file:{file_id}", "baseline", file_id) for file_id in file_ids]
+        if events:
+            self.repo.add_notification_events(user_id, events)
+        self.repo.set_meta(key, "1")
+        logger.info("Baseline de arquivos inicializado: %s arquivos", len(file_ids))
 
     def is_quiet(self, now: datetime) -> bool:
         local_time = now.astimezone(self.tz).time()
@@ -165,10 +186,13 @@ class NotificationService:
                 return NotificationRun(reason="quiet_hours")
 
             sent = 0
+            self.ensure_files_baseline()
             if self.config.new_assignments:
                 sent += await self._send_new_assignments()
             if self.config.announcements:
                 sent += await self._send_new_announcements()
+            if self.config.new_files:
+                sent += await self._send_new_files()
             sent += await self._send_due_reminders(current)
             if self.config.digest:
                 sent += await self._send_digest(current)
@@ -255,6 +279,20 @@ class NotificationService:
         events = [
             _event(f"new_announcement:{row['id']}", "new_announcement", row["id"]) for row in rows
         ]
+        return 1 if await self._send("\n".join(lines), events) else 0
+
+    async def _send_new_files(self) -> int:
+        rows = self.repo.list_unnotified_files(self.user.user_id, limit=20)
+        if not rows:
+            return 0
+
+        lines = ["Novos arquivos no Canvas:"]
+        for row in rows:
+            course = short_course_name(row.get("course_name"))
+            name = _clean(row.get("display_name"))
+            lines.append(f"- Arquivo novo em {course}: {name}")
+
+        events = [_event(f"new_file:{row['file_id']}", "new_file", row["file_id"]) for row in rows]
         return 1 if await self._send("\n".join(lines), events) else 0
 
     async def _send_due_reminders(self, now: datetime) -> int:

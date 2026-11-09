@@ -32,7 +32,11 @@ Pergunte em linguagem natural:
 - quais arquivos tem em Cálculo?
 
 Comandos:
-/sync - atualiza os dados do Canvas
+/sincronizar (ou /sync) - atualiza Canvas e baixa arquivos
+/arquivos <matéria> - lista os arquivos conhecidos
+/buscar <termo> - pesquisa nos materiais de todas as matérias
+/buscar <matéria>: <termo> - pesquisa nos materiais da matéria
+/trecho <n> - exibe o texto completo do resultado N da última busca
 /status - estado do cache e falhas recentes
 /testnotify - envia uma notificação de teste
 /help - esta ajuda
@@ -71,6 +75,9 @@ class TelegramChannel:
         on_message: MessageHandler,
         on_sync: Callable[[], Awaitable[str]],
         on_status: Callable[[], Awaitable[str]],
+        on_files: Callable[[str], Awaitable[str]] | None = None,
+        on_search: Callable[[str], Awaitable[str]] | None = None,
+        on_snippet: Callable[[str], Awaitable[str]] | None = None,
         on_test_notify: Callable[[], Awaitable[str]] | None = None,
         handler_timeout: float = 240.0,
     ) -> None:
@@ -85,6 +92,9 @@ class TelegramChannel:
         self.on_message = on_message
         self.on_sync = on_sync
         self.on_status = on_status
+        self.on_files = on_files
+        self.on_search = on_search
+        self.on_snippet = on_snippet
         self.on_test_notify = on_test_notify
         self.handler_timeout = handler_timeout
         self.app: Application | None = None
@@ -191,6 +201,51 @@ class TelegramChannel:
                 text = "Não consegui sincronizar agora. Veja os logs para detalhes."
         await self._reply(update, text)
 
+    async def _cmd_files(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_files is None:
+            await self._reply(update, "Comando de arquivos indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        await self._typing(update)
+        try:
+            text = await self.on_files(arg)
+        except Exception:
+            logger.exception("Falha no /arquivos")
+            text = "Não consegui listar os arquivos agora."
+        await self._reply(update, text)
+
+    async def _cmd_search(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_search is None:
+            await self._reply(update, "Busca indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        await self._typing(update)
+        try:
+            text = await self.on_search(arg)
+        except Exception:
+            logger.exception("Falha no /buscar")
+            text = "Não consegui realizar a busca agora."
+        await self._reply(update, text)
+
+    async def _cmd_snippet(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_snippet is None:
+            await self._reply(update, "Visualização de trecho indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        await self._typing(update)
+        try:
+            text = await self.on_snippet(arg)
+        except Exception:
+            logger.exception("Falha no /trecho")
+            text = "Não consegui carregar o trecho."
+        await self._reply(update, text)
+
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
@@ -240,6 +295,10 @@ class TelegramChannel:
         self.app.add_handler(CommandHandler("start", self._cmd_start))
         self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(CommandHandler("sync", self._cmd_sync))
+        self.app.add_handler(CommandHandler("sincronizar", self._cmd_sync))
+        self.app.add_handler(CommandHandler("arquivos", self._cmd_files))
+        self.app.add_handler(CommandHandler("buscar", self._cmd_search))
+        self.app.add_handler(CommandHandler("trecho", self._cmd_snippet))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
         self.app.add_handler(CommandHandler("testnotify", self._cmd_testnotify))
         self.app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))

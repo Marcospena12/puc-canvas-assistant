@@ -10,6 +10,16 @@ from .app import SyncRunner, build_status_text, format_sync_result, run_bot
 from .canvas import CanvasClient, CanvasService
 from .config import Settings
 from .db import Database
+from .knowledge.downloader import FileDownloader
+from .knowledge.extraction import ExtractionPipeline
+from .knowledge.file_sync import FileSyncService
+from .knowledge.report import (
+    build_files_text,
+    format_file_sync_result,
+    format_search_results,
+    resolve_course,
+)
+from .knowledge.search import search
 from .llm import create_provider
 from .logging_setup import setup_logging
 from .repository import Repository
@@ -88,6 +98,113 @@ async def _sync(settings: Settings) -> int:
     return 0
 
 
+async def _sync_files(settings: Settings) -> int:
+    user = settings.user
+    repo = _make_repo(settings)
+    tz = get_timezone(settings.timezone)
+    repo.clear_file_retries(user.user_id)
+    async with httpx.AsyncClient() as http:
+        canvas = CanvasService(CanvasClient(http, user.canvas_base_url, user.canvas_token))
+        downloader = FileDownloader(
+            http,
+            user.canvas_base_url,
+            user.canvas_token,
+            timeout=settings.file_download_timeout_seconds,
+        )
+        file_sync = FileSyncService(
+            repo,
+            canvas,
+            user,
+            tz,
+            settings.file_sync,
+            downloader,
+        )
+        result = await file_sync.sync_all(download=True)
+    print(format_file_sync_result(result))
+    return 0
+
+
+def _files(settings: Settings, query: str) -> None:
+    user = settings.user
+    repo = _make_repo(settings)
+    tz = get_timezone(settings.timezone)
+    print(build_files_text(repo, user, tz, query))
+
+
+def _extract(settings: Settings, *, force_all: bool = False) -> None:
+    user = settings.user
+    repo = _make_repo(settings)
+    pipeline = ExtractionPipeline(repo, user, settings.files_dir)
+    res = pipeline.run(force_all=force_all)
+    print("Extração de texto concluída:")
+    for line in res.as_lines():
+        print(f"- {line}")
+
+
+def _knowledge_stats(settings: Settings) -> None:
+    user = settings.user
+    repo = _make_repo(settings)
+    stats = repo.knowledge_stats(user.user_id)
+
+    print("Estatísticas da Base de Conhecimento:")
+    print("Status de extração dos arquivos:")
+    for st, count in sorted(stats["status_counts"].items()):
+        print(f"- {st}: {count}")
+
+    print("\nChunks por matéria:")
+    for c in stats["courses"]:
+        name = c["course_name"]
+        files_cnt = c["downloaded_files"]
+        chunks_cnt = c["chunks"]
+        chars_cnt = c["total_chars"]
+        print(f"- {name}: {files_cnt} arquivos baixados, {chunks_cnt} chunks, {chars_cnt} chars")
+
+    print("\nDistribuição de caracteres por chunk:")
+    print(
+        f"- total chunks: {stats['total_chunks']} | mín: {stats['min_chars']} | "
+        f"mediana: {stats['median_chars']} | "
+        f"média: {stats['avg_chars']} | máx: {stats['max_chars']}"
+    )
+
+    fts = stats.get("fts_consistency")
+    if fts:
+        print(
+            f"- consistência do índice FTS5: chunks={fts['chunks_count']} | fts={fts['fts_count']}"
+        )
+
+
+def _reindex(settings: Settings) -> None:
+    repo = _make_repo(settings)
+    indexed, total = repo.reindex_fts()
+    print(f"Reindexação FTS5 concluída: {indexed} chunks indexados (total na base: {total}).")
+
+
+def _cli_search(settings: Settings, query: str, course_query: str | None, k: int) -> None:
+    user = settings.user
+    repo = _make_repo(settings)
+
+    target_course_id: int | None = None
+    if course_query:
+        courses = repo.get_courses(user.user_id, current_only=True, include_non_subjects=False)
+        if not courses:
+            courses = repo.get_courses(user.user_id, current_only=False, include_non_subjects=False)
+        matched, candidates = resolve_course(courses, course_query)
+        if candidates:
+            cand_names = [c.get("name") for c in candidates]
+            print(
+                f"Mais de uma matéria corresponde a '{course_query}':\n"
+                + "\n".join(f"- {n}" for n in cand_names)
+            )
+            return
+        if not matched:
+            print(f"Matéria '{course_query}' não encontrada.")
+            return
+        target_course_id = int(matched["id"])
+
+    results = search(repo, user.user_id, query, course_id=target_course_id, k=k)
+    print(format_search_results(results, query))
+
+
 async def _ask(settings: Settings, question: str) -> None:
     user = settings.user
     repo = _make_repo(settings)
@@ -131,6 +248,23 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("run", help="inicia o bot do Telegram")
     sub.add_parser("check", help="valida configuração, Canvas e modelo local")
     sub.add_parser("sync", help="sincroniza o Canvas com o cache local")
+    sub.add_parser("sync-files", help="sincroniza e baixa arquivos das matérias ativas")
+    files_parser = sub.add_parser("files", help="lista arquivos conhecidos de uma matéria")
+    files_parser.add_argument("query", nargs="*", help="nome da matéria ou parte dele (opcional)")
+    extract_parser = sub.add_parser("extract", help="extrai texto dos arquivos baixados")
+    extract_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="reprocessa todos os arquivos, mesmo os já extraídos",
+    )
+    sub.add_parser("knowledge-stats", help="estatísticas da base de conhecimento (chunks e status)")
+    sub.add_parser("reindex", help="reconstrói o índice de busca FTS5 a partir dos chunks")
+    search_parser = sub.add_parser("search", help="pesquisa termos nos materiais de aula")
+    search_parser.add_argument("query", help="termo ou frase de busca")
+    search_parser.add_argument("--course", help="filtra por matéria (opcional)")
+    search_parser.add_argument(
+        "-k", type=int, default=8, help="número máximo de resultados (padrão: 8)"
+    )
     ask_parser = sub.add_parser("ask", help="faz uma pergunta ao agente pelo terminal")
     ask_parser.add_argument("question", nargs="+", help="pergunta em linguagem natural")
     sub.add_parser("status", help="mostra o estado do cache")
@@ -152,6 +286,23 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             print(f"Falha na sincronização: {exc}")
             raise SystemExit(1) from exc
+    elif args.command == "sync-files":
+        try:
+            asyncio.run(_sync_files(settings))
+        except Exception as exc:
+            print(f"Falha na sincronização de arquivos: {exc}")
+            raise SystemExit(1) from exc
+    elif args.command == "files":
+        query = " ".join(args.query) if args.query else ""
+        _files(settings, query)
+    elif args.command == "extract":
+        _extract(settings, force_all=bool(args.all))
+    elif args.command == "knowledge-stats":
+        _knowledge_stats(settings)
+    elif args.command == "reindex":
+        _reindex(settings)
+    elif args.command == "search":
+        _cli_search(settings, args.query, args.course, args.k)
     elif args.command == "ask":
         question = " ".join(args.question)
         asyncio.run(_ask(settings, question))

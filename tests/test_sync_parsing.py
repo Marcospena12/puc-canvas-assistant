@@ -106,6 +106,7 @@ def test_parse_file_uses_canvas_content_type_field() -> None:
         "modified_at": "2026-11-01T12:00:00Z",
         "hidden_for_user": False,
         "locked_for_user": True,
+        "folder_id": 42,
     }
 
     file = parse_file(raw, course_id=1)
@@ -114,6 +115,7 @@ def test_parse_file_uses_canvas_content_type_field() -> None:
     assert file.size == 2048
     assert file.locked is True
     assert file.updated_at == "2026-11-01T12:00:00+00:00"
+    assert file.folder_id == 42
 
 
 def test_parse_announcement_and_planner_item() -> None:
