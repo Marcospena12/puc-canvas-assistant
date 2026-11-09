@@ -1,0 +1,43 @@
+[project]
+name = "puc-canvas-assistant"
+version = "0.1.0"
+description = "Assistente pessoal para o Canvas LMS da PUC Minas"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx>=0.27",
+    "python-telegram-bot>=21.0",
+    "apscheduler>=3.10,<4.0",
+    "ollama>=0.4",
+    "openai>=1.40",
+    "pydantic>=2.8",
+    "pydantic-settings>=2.4",
+    "tzdata>=2024.1",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "respx>=0.21",
+    "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/canvas_assistant"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["explore_canvas.py", "canvas_dump"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
