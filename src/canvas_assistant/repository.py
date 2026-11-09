@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from contextlib import closing
 from datetime import UTC, datetime
 from typing import Any
@@ -357,6 +358,138 @@ class Repository:
                 """
                 SELECT * FROM sync_issues WHERE user_id = ?
                 ORDER BY created_at DESC, id DESC LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+        return _rows(rows)
+
+    # ----------------------------- notifications -----------------------------
+
+    def get_meta(self, key: str) -> str | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                "SELECT value FROM schema_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+        return str(row["value"]) if row else None
+
+    def set_meta(self, key: str, value: str) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO schema_meta (key, value) VALUES (?, ?)
+                ON CONFLICT (key) DO UPDATE SET value = excluded.value
+                """,
+                (key, value),
+            )
+
+    def add_notification_events(
+        self,
+        user_id: str,
+        events: Sequence[tuple[str, str, str | None]],
+    ) -> None:
+        if not events:
+            return
+        now = _now_iso()
+        rows = [(user_id, key, kind, resource_id, now) for key, kind, resource_id in events]
+        with closing(self.db.connect()) as conn, conn:
+            conn.executemany(
+                """
+                INSERT INTO notification_events
+                    (user_id, event_key, kind, resource_id, sent_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (user_id, event_key) DO NOTHING
+                """,
+                rows,
+            )
+
+    def has_notification_event(self, user_id: str, event_key: str) -> bool:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM notification_events
+                WHERE user_id = ? AND event_key = ?
+                LIMIT 1
+                """,
+                (user_id, event_key),
+            ).fetchone()
+        return row is not None
+
+    def get_notification_event_keys(self, user_id: str, event_keys: Sequence[str]) -> set[str]:
+        if not event_keys:
+            return set()
+        placeholders = ",".join("?" for _ in event_keys)
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT event_key FROM notification_events
+                WHERE user_id = ? AND event_key IN ({placeholders})
+                """,
+                [user_id, *event_keys],
+            ).fetchall()
+        return {str(row["event_key"]) for row in rows}
+
+    def list_assignment_ids(self, user_id: str) -> list[int]:
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT a.id
+                FROM assignments a
+                JOIN courses c ON c.user_id = a.user_id AND c.id = a.course_id
+                WHERE a.user_id = ? AND c.active = 1
+                """,
+                (user_id,),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def list_announcement_ids(self, user_id: str) -> list[int]:
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT a.id
+                FROM announcements a
+                JOIN courses c ON c.user_id = a.user_id AND c.id = a.course_id
+                WHERE a.user_id = ? AND c.active = 1
+                """,
+                (user_id,),
+            ).fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def list_unnotified_assignments(self, user_id: str, limit: int = 20) -> list[dict[str, Any]]:
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT a.*, c.name AS course_name
+                FROM assignments a
+                JOIN courses c ON c.user_id = a.user_id AND c.id = a.course_id
+                WHERE a.user_id = ? AND a.published = 1 AND c.active = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_events e
+                      WHERE e.user_id = a.user_id
+                        AND e.event_key = 'new_assignment:' || a.id
+                  )
+                ORDER BY (a.due_at IS NULL), a.due_at ASC, a.id ASC
+                LIMIT ?
+                """,
+                (user_id, limit),
+            ).fetchall()
+        return _rows(rows)
+
+    def list_unnotified_announcements(self, user_id: str, limit: int = 10) -> list[dict[str, Any]]:
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT a.*, c.name AS course_name, c.is_subject
+                FROM announcements a
+                JOIN courses c ON c.user_id = a.user_id AND c.id = a.course_id
+                WHERE a.user_id = ? AND c.active = 1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notification_events e
+                      WHERE e.user_id = a.user_id
+                        AND e.event_key = 'new_announcement:' || a.id
+                  )
+                ORDER BY a.posted_at DESC, a.id DESC
+                LIMIT ?
                 """,
                 (user_id, limit),
             ).fetchall()

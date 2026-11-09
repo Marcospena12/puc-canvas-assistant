@@ -162,9 +162,21 @@ CREATE TABLE IF NOT EXISTS sync_issues (
 );
 CREATE INDEX IF NOT EXISTS idx_sync_issues_user
     ON sync_issues (user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS notification_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    event_key TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    resource_id TEXT,
+    sent_at TEXT NOT NULL,
+    UNIQUE (user_id, event_key)
+);
+CREATE INDEX IF NOT EXISTS idx_notification_events_user
+    ON notification_events (user_id, kind, sent_at);
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class Database:
@@ -184,6 +196,7 @@ class Database:
             conn.execute("PRAGMA journal_mode = WAL")
             conn.executescript(SCHEMA_SQL)
             conn.execute(
-                "INSERT OR IGNORE INTO schema_meta (key, value) VALUES ('version', ?)",
+                "INSERT INTO schema_meta (key, value) VALUES ('version', ?) "
+                "ON CONFLICT (key) DO UPDATE SET value = excluded.value",
                 (str(SCHEMA_VERSION),),
             )

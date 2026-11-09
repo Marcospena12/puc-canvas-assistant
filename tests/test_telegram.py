@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from telegram.constants import ParseMode
 
 from canvas_assistant.channels.telegram import TelegramChannel, split_text
 from canvas_assistant.config import UserProfile
@@ -45,7 +46,7 @@ def make_update(user_id: int, chat_id: int) -> SimpleNamespace:
 
 def test_split_text_respects_limit_and_newlines() -> None:
     chunks = split_text("a" * 9000)
-    assert [len(chunk) for chunk in chunks] == [4000, 4000, 1000]
+    assert [len(chunk) for chunk in chunks] == [3000, 3000, 3000]
 
     chunks = split_text("x" * 50 + "\n" + "y" * 40, limit=60)
     assert chunks == ["x" * 50, "y" * 40]
@@ -104,3 +105,70 @@ async def test_on_text_passes_user_to_handler_and_replies() -> None:
 
     assert calls == [(channel.user, "oi")]
     assert replies == ["resposta"]
+
+
+async def test_send_message_returns_true_and_uses_html() -> None:
+    sent: list[dict] = []
+
+    async def bot_send_message(**kwargs) -> None:
+        sent.append(kwargs)
+
+    channel = make_channel()
+    channel.app = SimpleNamespace(bot=SimpleNamespace(send_message=bot_send_message))
+
+    ok = await channel.send_message(channel.user, "**oi**")
+
+    assert ok is True
+    assert sent[0]["chat_id"] == 10
+    assert sent[0]["text"] == "<b>oi</b>"
+    assert sent[0]["parse_mode"] == ParseMode.HTML
+
+
+async def test_send_message_returns_false_on_error() -> None:
+    async def bot_send_message(**kwargs) -> None:
+        raise RuntimeError("boom")
+
+    channel = make_channel()
+    channel.app = SimpleNamespace(bot=SimpleNamespace(send_message=bot_send_message))
+
+    assert await channel.send_message(channel.user, "oi") is False
+
+
+async def test_testnotify_command_calls_handler() -> None:
+    replies: list[str] = []
+
+    async def reply_text(text: str, **kwargs) -> None:
+        replies.append(text)
+
+    async def on_test_notify() -> str:
+        return "teste enviado"
+
+    channel = make_channel(on_test_notify=on_test_notify)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=20),
+        effective_chat=SimpleNamespace(id=10),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+
+    await channel._cmd_testnotify(update, None)
+
+    assert replies == ["teste enviado"]
+
+
+async def test_reply_sends_html_parse_mode() -> None:
+    sent: list[tuple[str, dict]] = []
+
+    async def reply_text(text: str, **kwargs) -> None:
+        sent.append((text, kwargs))
+
+    channel = make_channel()
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply_text))
+
+    await channel._reply(update, "**oi** [aqui](https://canvas.test/a)")
+
+    assert sent == [
+        (
+            '<b>oi</b> <a href="https://canvas.test/a">aqui</a>',
+            {"parse_mode": ParseMode.HTML, "disable_web_page_preview": True},
+        )
+    ]

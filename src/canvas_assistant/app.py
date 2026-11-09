@@ -12,6 +12,7 @@ from .channels import TelegramChannel
 from .config import Settings
 from .db import Database
 from .llm import create_provider
+from .notifications import NotificationService
 from .repository import Repository
 from .sync import SyncResult, SyncService
 from .timeutil import format_local, get_timezone
@@ -107,6 +108,7 @@ async def run_bot(settings: Settings) -> None:
         provider = create_provider(settings.llm)
         agent = Agent(provider, repo, user, tz)
         scheduler = AsyncIOScheduler(timezone=tz)
+        notifications: NotificationService | None = None
 
         async def refresh_job() -> None:
             result = await runner.run(block=False)
@@ -117,6 +119,9 @@ async def run_bot(settings: Settings) -> None:
                     result.assignments,
                     result.announcements,
                 )
+                if notifications is not None:
+                    notifications.mark_sync_success()
+                    await notifications.run_cycle()
 
         async def on_message(_user: object, text: str) -> str:
             return await agent.reply(text)
@@ -125,6 +130,9 @@ async def run_bot(settings: Settings) -> None:
             result = await runner.run(block=False)
             if result is None:
                 return "Já existe uma sincronização em andamento."
+            if notifications is not None:
+                notifications.mark_sync_success()
+                await notifications.run_cycle()
             return format_sync_result(result)
 
         async def on_status() -> str:
@@ -140,6 +148,8 @@ async def run_bot(settings: Settings) -> None:
             on_status=on_status,
             handler_timeout=settings.llm_timeout_seconds + 60,
         )
+        notifications = NotificationService(repo, user, tz, channel, settings.notification)
+        channel.on_test_notify = notifications.send_test
 
         try:
             logger.info("Sincronização inicial…")
@@ -147,6 +157,8 @@ async def run_bot(settings: Settings) -> None:
                 initial = await runner.run(block=True)
                 if initial is not None:
                     logger.info("Sincronização inicial: %s cursos", initial.courses)
+                    notifications.mark_sync_success()
+                    notifications.initialize()
                     for issue in initial.issues:
                         logger.warning("Falha na sincronização inicial: %s", issue)
             except Exception as exc:
@@ -158,6 +170,15 @@ async def run_bot(settings: Settings) -> None:
                 "interval",
                 minutes=settings.poll_interval_minutes,
                 id="refresh_canvas",
+                max_instances=1,
+                coalesce=True,
+                misfire_grace_time=120,
+            )
+            scheduler.add_job(
+                notifications.run_cycle,
+                "interval",
+                minutes=settings.notify_check_minutes,
+                id="notifications",
                 max_instances=1,
                 coalesce=True,
                 misfire_grace_time=120,

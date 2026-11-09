@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import time
 from pathlib import Path
 from typing import Literal
 
@@ -18,6 +19,33 @@ _DEFAULT_BASE_URLS: dict[str, str] = {
 }
 
 
+def _parse_clock(value: str, field: str) -> time:
+    match = re.fullmatch(r"(\d{1,2}):(\d{2})", (value or "").strip())
+    if not match:
+        raise ValueError(f"{field} deve estar no formato HH:MM")
+    hour, minute = int(match.group(1)), int(match.group(2))
+    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+        raise ValueError(f"{field} deve ser um horário válido")
+    return time(hour, minute)
+
+
+def _parse_due_hours(value: str) -> tuple[int, ...]:
+    hours: set[int] = set()
+    for part in re.split(r"[,\s]+", (value or "").strip()):
+        if not part:
+            continue
+        try:
+            hour = int(part)
+        except ValueError as exc:
+            raise ValueError("NOTIFY_DUE_HOURS deve conter horas inteiras") from exc
+        if hour <= 0:
+            raise ValueError("NOTIFY_DUE_HOURS deve conter apenas horas positivas")
+        hours.add(hour)
+    if not hours:
+        raise ValueError("NOTIFY_DUE_HOURS não pode ficar vazio")
+    return tuple(sorted(hours))
+
+
 @dataclass(frozen=True, slots=True)
 class UserProfile:
     user_id: str
@@ -25,6 +53,20 @@ class UserProfile:
     canvas_token: str
     telegram_chat_id: int | None
     telegram_user_ids: frozenset[int]
+
+
+@dataclass(frozen=True, slots=True)
+class NotificationConfig:
+    enabled: bool
+    new_assignments: bool
+    due_hours: tuple[int, ...]
+    announcements: bool
+    digest: bool
+    digest_time: time
+    quiet_start: time
+    quiet_end: time
+    max_stale_minutes: int
+    digest_grace_minutes: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,6 +106,18 @@ class Settings(BaseSettings):
     llm_max_tokens: int = Field(default=800, ge=64, le=8192)
     llm_num_ctx: int = Field(default=8192, ge=2048, le=131072)
     llm_timeout_seconds: int = Field(default=180, ge=10, le=900)
+
+    notify_enabled: bool = True
+    notify_new_assignments: bool = True
+    notify_due_hours: str = "24,2"
+    notify_announcements: bool = True
+    notify_digest: bool = True
+    notify_digest_time: str = "08:00"
+    notify_quiet_start: str = "22:00"
+    notify_quiet_end: str = "07:00"
+    notify_max_stale_minutes: int = Field(default=45, ge=5, le=1440)
+    notify_check_minutes: int = Field(default=5, ge=1, le=60)
+    notify_digest_grace_minutes: int = Field(default=120, ge=0, le=720)
 
     db_path: Path = Path("data/assistant.sqlite3")
     timezone: str = "America/Sao_Paulo"
@@ -105,6 +159,21 @@ class Settings(BaseSettings):
             canvas_token=self.canvas_token.get_secret_value(),
             telegram_chat_id=self.telegram_chat_id,
             telegram_user_ids=self.allowed_telegram_user_ids,
+        )
+
+    @property
+    def notification(self) -> NotificationConfig:
+        return NotificationConfig(
+            enabled=self.notify_enabled,
+            new_assignments=self.notify_new_assignments,
+            due_hours=_parse_due_hours(self.notify_due_hours),
+            announcements=self.notify_announcements,
+            digest=self.notify_digest,
+            digest_time=_parse_clock(self.notify_digest_time, "NOTIFY_DIGEST_TIME"),
+            quiet_start=_parse_clock(self.notify_quiet_start, "NOTIFY_QUIET_START"),
+            quiet_end=_parse_clock(self.notify_quiet_end, "NOTIFY_QUIET_END"),
+            max_stale_minutes=self.notify_max_stale_minutes,
+            digest_grace_minutes=self.notify_digest_grace_minutes,
         )
 
     @property

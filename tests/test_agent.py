@@ -129,6 +129,77 @@ async def test_agent_reports_unknown_tool_to_model(repo, user, tz, course_factor
     assert "ferramenta desconhecida" in tool_message.content
 
 
+async def test_agent_accepts_link_from_current_context(
+    repo, user, tz, course_factory, assignment_factory
+) -> None:
+    course = course_factory()
+    assignment = assignment_factory(due_at=to_utc_iso(utc_now() + timedelta(days=1)))
+    seed(repo, user, course, assignment)
+    provider = FakeProvider(
+        [LLMResponse(text=("Você tem [Lista 1](https://canvas.test/assignments/100) para amanhã."))]
+    )
+    agent = Agent(provider, repo, user, tz)
+
+    answer = await agent.reply("o que tenho amanhã?")
+
+    assert "Lista 1" in answer
+    assert len(provider.calls) == 1
+
+
+async def test_agent_corrects_invented_task_and_falls_back(
+    repo, user, tz, course_factory, assignment_factory
+) -> None:
+    course = course_factory(id=292828, name="Trabalho Interdisciplinar")
+    assignment = assignment_factory(
+        id=1404750,
+        course_id=292828,
+        name="Elaboração de projeto (passo 2)",
+        html_url="https://canvas.test/courses/292828/assignments/1404750",
+        due_at=to_utc_iso(utc_now() + timedelta(days=1)),
+    )
+    seed(repo, user, course, assignment)
+    fake = "https://canvas.test/courses/292828/assignments/1404751"
+    provider = FakeProvider(
+        [
+            LLMResponse(
+                text="",
+                tool_calls=[
+                    ToolCall(
+                        name="get_upcoming_items",
+                        arguments={"period": "next_7_days"},
+                        id="call-1",
+                    )
+                ],
+            ),
+            LLMResponse(
+                text=(
+                    f"Você tem 2 tarefas: Elaboração (passo 2) e [Relatório de atividades]({fake})."
+                )
+            ),
+            LLMResponse(
+                text=(
+                    f"Você tem 2 tarefas: Elaboração (passo 2) e [Relatório de atividades]({fake})."
+                )
+            ),
+        ]
+    )
+    agent = Agent(provider, repo, user, tz)
+
+    answer = await agent.reply("o que tenho essa semana?")
+
+    assert len(provider.calls) == 3
+    correction_messages = [
+        message
+        for message in provider.calls[2][0]
+        if message.role == "system" and "não confirmados" in message.content
+    ]
+    assert correction_messages
+    assert "Elaboração de projeto (passo 2)" in answer
+    assert "1404750" in answer
+    assert "1404751" not in answer
+    assert "Relatório de atividades" not in answer
+
+
 async def test_tool_registry_rejects_invalid_arguments(repo, user, tz) -> None:
     registry = ToolRegistry(repo, user, tz)
 

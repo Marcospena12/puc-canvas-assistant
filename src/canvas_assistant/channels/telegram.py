@@ -5,7 +5,8 @@ import logging
 from collections.abc import Awaitable, Callable
 
 from telegram import Update
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
+from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -16,6 +17,7 @@ from telegram.ext import MessageHandler as TelegramMessageHandler
 
 from ..config import UserProfile
 from .base import MessageHandler
+from .formatting import to_telegram_html
 
 logger = logging.getLogger(__name__)
 
@@ -32,11 +34,12 @@ Pergunte em linguagem natural:
 Comandos:
 /sync - atualiza os dados do Canvas
 /status - estado do cache e falhas recentes
+/testnotify - envia uma notificação de teste
 /help - esta ajuda
 
 O bot só responde ao seu usuário/chat configurado."""
 
-MAX_MESSAGE = 4000
+MAX_MESSAGE = 3000
 
 
 def split_text(text: str, limit: int = MAX_MESSAGE) -> list[str]:
@@ -47,9 +50,11 @@ def split_text(text: str, limit: int = MAX_MESSAGE) -> list[str]:
     while len(text) > limit:
         cut = text.rfind("\n", 0, limit)
         if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit)
+        if cut < limit // 2:
             cut = limit
         chunks.append(text[:cut].rstrip())
-        text = text[cut:].lstrip("\n")
+        text = text[cut:].lstrip()
     if text:
         chunks.append(text)
     return chunks
@@ -66,6 +71,7 @@ class TelegramChannel:
         on_message: MessageHandler,
         on_sync: Callable[[], Awaitable[str]],
         on_status: Callable[[], Awaitable[str]],
+        on_test_notify: Callable[[], Awaitable[str]] | None = None,
         handler_timeout: float = 240.0,
     ) -> None:
         if chat_id is None and not allowed_user_ids:
@@ -79,6 +85,7 @@ class TelegramChannel:
         self.on_message = on_message
         self.on_sync = on_sync
         self.on_status = on_status
+        self.on_test_notify = on_test_notify
         self.handler_timeout = handler_timeout
         self.app: Application | None = None
         self._stop_event: asyncio.Event | None = None
@@ -108,25 +115,53 @@ class TelegramChannel:
             return
         for chunk in split_text(text):
             try:
-                await message.reply_text(chunk, disable_web_page_preview=True)
+                await message.reply_text(
+                    to_telegram_html(chunk),
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except BadRequest:
+                logger.warning("Telegram rejeitou HTML; reenviando como texto puro")
+                try:
+                    await message.reply_text(chunk, disable_web_page_preview=True)
+                except Exception:
+                    logger.exception("Falha ao enviar mensagem no Telegram")
+                    return
             except Exception:
                 logger.exception("Falha ao enviar mensagem no Telegram")
                 return
 
-    async def send_message(self, user: UserProfile, text: str) -> None:
+    async def send_message(self, user: UserProfile, text: str) -> bool:
         chat_id = user.telegram_chat_id or self.chat_id
         if chat_id is None or self.app is None:
             logger.error("Telegram sem chat configurado ou bot não iniciado")
-            return
+            return False
+        sent_any = False
         for chunk in split_text(text):
             try:
                 await self.app.bot.send_message(
                     chat_id=chat_id,
-                    text=chunk,
+                    text=to_telegram_html(chunk),
+                    parse_mode=ParseMode.HTML,
                     disable_web_page_preview=True,
                 )
+                sent_any = True
+            except BadRequest:
+                logger.warning("Telegram rejeitou HTML; reenviando como texto puro")
+                try:
+                    await self.app.bot.send_message(
+                        chat_id=chat_id,
+                        text=chunk,
+                        disable_web_page_preview=True,
+                    )
+                    sent_any = True
+                except Exception:
+                    logger.exception("Falha ao enviar mensagem proativa no Telegram")
+                    return sent_any
             except Exception:
                 logger.exception("Falha ao enviar mensagem proativa no Telegram")
+                return sent_any
+        return sent_any
 
     async def _cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
@@ -166,6 +201,19 @@ class TelegramChannel:
             text = "Não consegui montar o status agora."
         await self._reply(update, text)
 
+    async def _cmd_testnotify(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_test_notify is None:
+            await self._reply(update, "Notificações não estão configuradas.")
+            return
+        try:
+            text = await self.on_test_notify()
+        except Exception:
+            logger.exception("Falha no /testnotify")
+            text = "Não consegui enviar a notificação de teste."
+        await self._reply(update, text)
+
     async def _on_text(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             logger.debug("Mensagem ignorada de usuário/chat não autorizado")
@@ -193,6 +241,7 @@ class TelegramChannel:
         self.app.add_handler(CommandHandler("help", self._cmd_help))
         self.app.add_handler(CommandHandler("sync", self._cmd_sync))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
+        self.app.add_handler(CommandHandler("testnotify", self._cmd_testnotify))
         self.app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         self._stop_event = asyncio.Event()
 

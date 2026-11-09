@@ -13,6 +13,7 @@ from ..config import UserProfile
 from ..htmltext import html_to_text
 from ..llm.base import ToolSpec
 from ..repository import Repository
+from ..textutil import short_course_name
 from ..timeutil import (
     format_date_local,
     format_local,
@@ -270,6 +271,7 @@ class ToolRegistry:
                 {
                     "course_id": course["id"],
                     "name": course["name"],
+                    "short_name": short_course_name(course["name"]),
                     "code": course["course_code"],
                     "term": course.get("term_name"),
                     "current_term": current,
@@ -332,6 +334,7 @@ class ToolRegistry:
                 {
                     "course_id": row["id"],
                     "name": row["name"],
+                    "short_name": short_course_name(row["name"]),
                     "term": row.get("term_name"),
                     "score": round(row["current_score"], 2)
                     if row.get("current_score") is not None
@@ -364,6 +367,7 @@ class ToolRegistry:
         return {
             "course_id": parsed.course_id,
             "course": course["name"],
+            "course_short": short_course_name(course["name"]),
             "status": parsed.status,
             "assignments": items,
             "count": len(items),
@@ -392,6 +396,7 @@ class ToolRegistry:
                 {
                     "id": row["id"],
                     "course": row["course_name"],
+                    "course_short": short_course_name(row["course_name"]),
                     "title": row["title"],
                     "author": row.get("author"),
                     "posted_at": format_local(row.get("posted_at"), self.tz),
@@ -443,6 +448,7 @@ class ToolRegistry:
                 {
                     "name": row["display_name"],
                     "course": row["course_name"],
+                    "course_short": short_course_name(row["course_name"]),
                     "type": row.get("mime_class") or row.get("content_type"),
                     "size": _human_size(row.get("size")),
                     "updated_at": format_local(row.get("updated_at"), self.tz),
@@ -472,6 +478,7 @@ class ToolRegistry:
                 {
                     "name": title,
                     "course": item["course_name"],
+                    "course_short": short_course_name(item["course_name"]),
                     "type": "arquivo (módulo)",
                     "size": None,
                     "updated_at": None,
@@ -503,6 +510,7 @@ class ToolRegistry:
         return {
             "id": row["id"],
             "course": row.get("course_name"),
+            "course_short": short_course_name(row.get("course_name")),
             "title": row["name"],
             "due_at": format_local(row.get("due_at"), self.tz)
             if row.get("due_at")
