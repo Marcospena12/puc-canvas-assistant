@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from canvas_assistant.channels.telegram import TelegramChannel, split_text
+from canvas_assistant.config import UserProfile
 
 
 async def _dummy_message(*args, **kwargs) -> str:
@@ -18,6 +19,13 @@ async def _dummy_sync() -> str:
 def make_channel(**overrides) -> TelegramChannel:
     data = {
         "token": "token",
+        "user": UserProfile(
+            user_id="test",
+            canvas_base_url="https://canvas.test",
+            canvas_token="token",
+            telegram_chat_id=10,
+            telegram_user_ids=frozenset({20}),
+        ),
         "chat_id": 10,
         "allowed_user_ids": frozenset({20}),
         "on_message": _dummy_message,
@@ -69,3 +77,30 @@ def test_authorized_accepts_chat_only_config() -> None:
 def test_channel_requires_some_authorization() -> None:
     with pytest.raises(ValueError):
         make_channel(chat_id=None, allowed_user_ids=frozenset())
+
+
+async def test_on_text_passes_user_to_handler_and_replies() -> None:
+    calls: list[tuple[UserProfile, str]] = []
+    replies: list[str] = []
+
+    async def handler(user: UserProfile, text: str) -> str:
+        calls.append((user, text))
+        return "resposta"
+
+    async def reply_text(text: str, **kwargs) -> None:
+        replies.append(text)
+
+    async def send_action(action: str) -> None:
+        return None
+
+    channel = make_channel(on_message=handler)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=20),
+        effective_chat=SimpleNamespace(id=10, send_action=send_action),
+        effective_message=SimpleNamespace(text="oi", reply_text=reply_text),
+    )
+
+    await channel._on_text(update, None)
+
+    assert calls == [(channel.user, "oi")]
+    assert replies == ["resposta"]

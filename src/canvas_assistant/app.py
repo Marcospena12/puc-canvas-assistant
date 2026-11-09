@@ -132,6 +132,7 @@ async def run_bot(settings: Settings) -> None:
 
         channel = TelegramChannel(
             settings.telegram_bot_token.get_secret_value(),
+            user=user,
             chat_id=user.telegram_chat_id,
             allowed_user_ids=user.telegram_user_ids,
             on_message=on_message,

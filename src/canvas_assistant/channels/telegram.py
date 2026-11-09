@@ -60,6 +60,7 @@ class TelegramChannel:
         self,
         token: str,
         *,
+        user: UserProfile,
         chat_id: int | None,
         allowed_user_ids: frozenset[int],
         on_message: MessageHandler,
@@ -72,6 +73,7 @@ class TelegramChannel:
                 "Configure TELEGRAM_CHAT_ID e/ou TELEGRAM_ALLOWED_USER_IDS para autorizar o bot"
             )
         self.token = token
+        self.user = user
         self.chat_id = chat_id
         self.allowed_user_ids = allowed_user_ids
         self.on_message = on_message
@@ -173,7 +175,9 @@ class TelegramChannel:
             return
         await self._typing(update)
         try:
-            answer = await asyncio.wait_for(self.on_message(text), timeout=self.handler_timeout)
+            answer = await asyncio.wait_for(
+                self.on_message(self.user, text), timeout=self.handler_timeout
+            )
         except TimeoutError:
             answer = "A consulta demorou demais. Tente uma pergunta mais específica."
         except Exception:
@@ -196,7 +200,7 @@ class TelegramChannel:
         await self.app.start()
         if self.app.updater is None:
             raise RuntimeError("Telegram updater indisponível")
-        await self.app.updater.start_polling(allowed_updates=Update.MESSAGE)
+        await self.app.updater.start_polling(allowed_updates=[Update.MESSAGE])
         logger.info("Bot do Telegram iniciado")
         try:
             await self._stop_event.wait()
