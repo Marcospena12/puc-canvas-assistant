@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import Awaitable, Callable
 
@@ -17,7 +18,7 @@ from telegram.ext import MessageHandler as TelegramMessageHandler
 
 from ..config import UserProfile
 from .base import MessageHandler
-from .formatting import to_telegram_html
+from .formatting import format_llm_for_telegram, to_telegram_html
 
 logger = logging.getLogger(__name__)
 
@@ -36,8 +37,17 @@ Comandos:
 /arquivos <matéria> - lista os arquivos conhecidos
 /buscar <termo> - pesquisa nos materiais de todas as matérias
 /buscar <matéria>: <termo> - pesquisa nos materiais da matéria
+/tarefas [matéria] - lista as tarefas pendentes por prazo
+/tarefa <n | título> - briefing estruturado para entender e planejar a tarefa
 /trecho <n> - exibe o texto completo do resultado N da última busca
+/explicar [matéria:] <tópico> - explicação de até ~12 linhas com fontes
+/resumo <matéria> <arquivo> [faixa] - resumo estruturado com termos-chave
+/quiz <matéria> <tópico> [n] - questões de estudo baseadas no material
+/gabarito - respostas comentadas do último quiz
+/uso - consumo de tokens de estudo dos últimos 7 dias
 /status - estado do cache e falhas recentes
+/saude - diagnóstico do sistema, banco, LLM e incidentes
+/revisar <n | título> - revisa seu rascunho contra os critérios da tarefa
 /testnotify - envia uma notificação de teste
 /help - esta ajuda
 
@@ -75,10 +85,20 @@ class TelegramChannel:
         on_message: MessageHandler,
         on_sync: Callable[[], Awaitable[str]],
         on_status: Callable[[], Awaitable[str]],
+        on_health: Callable[[], Awaitable[str]] | None = None,
         on_files: Callable[[str], Awaitable[str]] | None = None,
         on_search: Callable[[str], Awaitable[str]] | None = None,
         on_snippet: Callable[[str], Awaitable[str]] | None = None,
+        on_tasks: Callable[[str], Awaitable[str]] | None = None,
+        on_task_briefing: Callable[[str], Awaitable[str]] | None = None,
+        on_explain: Callable[[str], Awaitable[str]] | None = None,
+        on_summary: Callable[[str], Awaitable[str]] | None = None,
+        on_quiz: Callable[[str], Awaitable[str]] | None = None,
+        on_answer_key: Callable[[], Awaitable[str]] | None = None,
+        on_usage: Callable[[], Awaitable[str]] | None = None,
         on_test_notify: Callable[[], Awaitable[str]] | None = None,
+        on_review: Callable[[str], Awaitable[str]] | None = None,
+        on_review_document: Callable[[object, object], Awaitable[str]] | None = None,
         handler_timeout: float = 240.0,
     ) -> None:
         if chat_id is None and not allowed_user_ids:
@@ -92,10 +112,20 @@ class TelegramChannel:
         self.on_message = on_message
         self.on_sync = on_sync
         self.on_status = on_status
+        self.on_health = on_health
         self.on_files = on_files
         self.on_search = on_search
         self.on_snippet = on_snippet
+        self.on_tasks = on_tasks
+        self.on_task_briefing = on_task_briefing
+        self.on_explain = on_explain
+        self.on_summary = on_summary
+        self.on_quiz = on_quiz
+        self.on_answer_key = on_answer_key
+        self.on_usage = on_usage
         self.on_test_notify = on_test_notify
+        self.on_review = on_review
+        self.on_review_document = on_review_document
         self.handler_timeout = handler_timeout
         self.app: Application | None = None
         self._stop_event: asyncio.Event | None = None
@@ -118,6 +148,12 @@ class TelegramChannel:
                 await update.effective_chat.send_action(ChatAction.TYPING)
         except Exception:
             logger.debug("Não foi possível enviar ação de digitando", exc_info=True)
+
+    async def _keep_typing(self, update: Update, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            await self._typing(update)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=4.0)
 
     async def _reply(self, update: Update, text: str) -> None:
         message = update.effective_message
@@ -246,6 +282,198 @@ class TelegramChannel:
             text = "Não consegui carregar o trecho."
         await self._reply(update, text)
 
+    async def _cmd_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_tasks is None:
+            await self._reply(update, "Consulta de tarefas pendentes indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        await self._typing(update)
+        try:
+            text = await self.on_tasks(arg)
+        except Exception:
+            logger.exception("Falha no /tarefas")
+            text = "Não consegui consultar as tarefas pendentes agora."
+        await self._reply(update, text)
+
+    async def _cmd_task_briefing(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_task_briefing is None:
+            await self._reply(update, "Briefing de tarefa indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        if not arg:
+            await self._reply(
+                update,
+                "Uso: /tarefa <n | título>\n"
+                "Exemplo: /tarefa 1\n"
+                "Exemplo: /tarefa Elaboração de projeto",
+            )
+            return
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_task_briefing(arg)
+        except Exception:
+            logger.exception("Falha no /tarefa")
+            text = "Não consegui gerar o briefing da tarefa agora. Tente novamente mais tarde."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        await self._reply(update, format_llm_for_telegram(text))
+
+    async def _cmd_explain(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_explain is None:
+            await self._reply(update, "Comando de explicação indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        if not arg:
+            await self._reply(
+                update,
+                "Uso: /explicar [matéria:] <tópico>\nExemplo: /explicar BI: modelagem dimensional",
+            )
+            return
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_explain(arg)
+        except Exception:
+            logger.exception("Falha no /explicar")
+            text = "Não consegui gerar a explicação agora. Tente novamente mais tarde."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        await self._reply(update, format_llm_for_telegram(text))
+
+    async def _cmd_summary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_summary is None:
+            await self._reply(update, "Comando de resumo indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        if not arg:
+            await self._reply(
+                update,
+                "Uso: /resumo <matéria> <arquivo ou aula> [faixa]\n"
+                "Exemplo: /resumo BI Aula02\n"
+                "Exemplo: /resumo DAM Aula04 páginas 1-15",
+            )
+            return
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_summary(arg)
+        except Exception:
+            logger.exception("Falha no /resumo")
+            text = "Não consegui gerar o resumo agora. Tente novamente mais tarde."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        await self._reply(update, format_llm_for_telegram(text))
+
+    async def _cmd_quiz(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_quiz is None:
+            await self._reply(update, "Comando de quiz indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        if not arg:
+            await self._reply(
+                update,
+                "Uso: /quiz <matéria> <tópico> [n]\n"
+                "Exemplo: /quiz BI 'modelagem dimensional' 5\n"
+                "Exemplo: /quiz DAM 'React Native'",
+            )
+            return
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_quiz(arg)
+        except Exception:
+            logger.exception("Falha no /quiz")
+            text = "Não consegui gerar o quiz agora. Tente novamente mais tarde."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        await self._reply(update, format_llm_for_telegram(text))
+
+    async def _cmd_answer_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_answer_key is None:
+            await self._reply(update, "Gabarito indisponível.")
+            return
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_answer_key()
+        except Exception:
+            logger.exception("Falha no /gabarito")
+            text = "Não consegui recuperar o gabarito."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        await self._reply(update, format_llm_for_telegram(text))
+
+    async def _cmd_usage(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_usage is None:
+            await self._reply(update, "Relatório de uso indisponível.")
+            return
+        try:
+            text = await self.on_usage()
+        except Exception:
+            logger.exception("Falha no /uso")
+            text = "Não consegui montar o relatório de uso agora."
+        await self._reply(update, text)
+
+    async def _cmd_review(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_review is None:
+            await self._reply(update, "Revisão de rascunho indisponível.")
+            return
+        arg = " ".join(context.args) if context.args else ""
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_review(arg)
+        except Exception:
+            logger.exception("Falha no /revisar")
+            text = "Não consegui iniciar a revisão agora. Tente novamente mais tarde."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        await self._reply(update, format_llm_for_telegram(text))
+
+    async def _on_document(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_review_document is None:
+            return
+        doc = update.effective_message.document if update.effective_message else None
+        if doc is None:
+            return
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
+        try:
+            text = await self.on_review_document(update, context)
+        except Exception:
+            logger.exception("Falha ao processar documento de revisão")
+            text = "Não consegui processar o arquivo agora."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
+        if text:
+            await self._reply(update, format_llm_for_telegram(text))
+
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorized(update):
             return
@@ -254,6 +482,19 @@ class TelegramChannel:
         except Exception:
             logger.exception("Falha no /status")
             text = "Não consegui montar o status agora."
+        await self._reply(update, text)
+
+    async def _cmd_health(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
+        if self.on_health is None:
+            await self._reply(update, "Saúde indisponível.")
+            return
+        try:
+            text = await self.on_health()
+        except Exception:
+            logger.exception("Falha no /saude")
+            text = "Não consegui montar o diagnóstico agora."
         await self._reply(update, text)
 
     async def _cmd_testnotify(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -276,7 +517,8 @@ class TelegramChannel:
         text = (update.effective_message.text or "").strip() if update.effective_message else ""
         if not text:
             return
-        await self._typing(update)
+        stop_typing = asyncio.Event()
+        typing_task = asyncio.create_task(self._keep_typing(update, stop_typing))
         try:
             answer = await asyncio.wait_for(
                 self.on_message(self.user, text), timeout=self.handler_timeout
@@ -286,8 +528,11 @@ class TelegramChannel:
         except Exception:
             logger.exception("Falha no agente")
             answer = "Tive um problema ao processar sua mensagem. Tente de novo."
+        finally:
+            stop_typing.set()
+            typing_task.cancel()
         if answer:
-            await self._reply(update, answer)
+            await self._reply(update, format_llm_for_telegram(answer))
 
     async def start(self, handler: MessageHandler) -> None:
         self.on_message = handler
@@ -298,9 +543,19 @@ class TelegramChannel:
         self.app.add_handler(CommandHandler("sincronizar", self._cmd_sync))
         self.app.add_handler(CommandHandler("arquivos", self._cmd_files))
         self.app.add_handler(CommandHandler("buscar", self._cmd_search))
+        self.app.add_handler(CommandHandler("tarefas", self._cmd_tasks))
+        self.app.add_handler(CommandHandler("tarefa", self._cmd_task_briefing))
         self.app.add_handler(CommandHandler("trecho", self._cmd_snippet))
+        self.app.add_handler(CommandHandler("explicar", self._cmd_explain))
+        self.app.add_handler(CommandHandler("resumo", self._cmd_summary))
+        self.app.add_handler(CommandHandler("quiz", self._cmd_quiz))
+        self.app.add_handler(CommandHandler("gabarito", self._cmd_answer_key))
+        self.app.add_handler(CommandHandler("uso", self._cmd_usage))
         self.app.add_handler(CommandHandler("status", self._cmd_status))
+        self.app.add_handler(CommandHandler("saude", self._cmd_health))
         self.app.add_handler(CommandHandler("testnotify", self._cmd_testnotify))
+        self.app.add_handler(CommandHandler("revisar", self._cmd_review))
+        self.app.add_handler(TelegramMessageHandler(filters.Document.ALL, self._on_document))
         self.app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._on_text))
         self._stop_event = asyncio.Event()
 

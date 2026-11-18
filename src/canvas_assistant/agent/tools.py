@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from ..config import UserProfile
 from ..htmltext import html_to_text
+from ..knowledge.study_context import build_context
 from ..llm.base import ToolSpec
 from ..repository import Repository
 from ..textutil import short_course_name
@@ -89,6 +90,33 @@ class ListFilesArgs(BaseModel):
     limit: int = Field(30, ge=1, le=50, description="Máximo de arquivos retornados.")
 
 
+class SearchCourseMaterialArgs(BaseModel):
+    query: str = Field(..., description="Termo ou pergunta sobre o conteúdo das aulas.")
+    course_id: int | None = Field(
+        None,
+        description="ID do curso no Canvas (opcional; omita para buscar em todas as matérias).",
+    )
+    source_types: list[str] | None = Field(
+        None,
+        description="Filtro opcional por tipo: 'arquivo', 'pagina', 'tarefa', 'ementa', 'aviso'.",
+    )
+    k: int = Field(5, ge=1, le=10, description="Máximo de trechos retornados.")
+
+
+class GetFileChunksArgs(BaseModel):
+    file_id: int | None = Field(None, description="ID do arquivo no Canvas.")
+    filename: str | None = Field(
+        None, description="Nome ou trecho do nome do arquivo caso não saiba o file_id."
+    )
+    location_start: int | None = Field(
+        None, description="Slide ou página inicial da faixa desejada (opcional)."
+    )
+    location_end: int | None = Field(
+        None, description="Slide ou página final da faixa desejada (opcional)."
+    )
+    limit: int = Field(10, ge=1, le=20, description="Máximo de blocos de texto retornados.")
+
+
 ARGS_MODELS: dict[str, type[BaseModel]] = {
     "get_courses": GetCoursesArgs,
     "get_upcoming_items": GetUpcomingArgs,
@@ -96,6 +124,8 @@ ARGS_MODELS: dict[str, type[BaseModel]] = {
     "get_assignments": GetAssignmentsArgs,
     "get_announcements": GetAnnouncementsArgs,
     "list_course_files": ListFilesArgs,
+    "search_course_material": SearchCourseMaterialArgs,
+    "get_file_chunks": GetFileChunksArgs,
 }
 
 TOOL_SPECS = [
@@ -145,6 +175,23 @@ TOOL_SPECS = [
             "Lista arquivos publicados (PDF, PPTX, DOCX etc.) com nome, tipo, "
             "tamanho, data e link. "
             "Pode filtrar por matéria e por texto no nome."
+        ),
+        input_schema={},
+    ),
+    ToolSpec(
+        name="search_course_material",
+        description=(
+            "Pesquisa o conteúdo das aulas, slides, apostilas e PDFs das matérias. "
+            "Use OBRIGATORIAMENTE para responder a dúvidas de conteúdo acadêmico, conceitos, "
+            "definições e tópicos de aula. Retorna blocos numerados com fonte e cobertura."
+        ),
+        input_schema={},
+    ),
+    ToolSpec(
+        name="get_file_chunks",
+        description=(
+            "Recupera o texto bruto ou trechos de páginas/slides de um arquivo específico. "
+            "Para arquivos extensos, exija ou forneça a faixa (location_start e location_end)."
         ),
         input_schema={},
     ),
@@ -224,6 +271,8 @@ class ToolRegistry:
             "get_assignments": self._get_assignments,
             "get_announcements": self._get_announcements,
             "list_course_files": self._list_course_files,
+            "search_course_material": self._search_course_material,
+            "get_file_chunks": self._get_file_chunks,
         }
 
     @property
@@ -502,6 +551,102 @@ class ToolRegistry:
             "files": results[: parsed.limit],
             "count": min(len(results), parsed.limit),
             "notes": notes,
+        }
+
+    def _search_course_material(self, args: BaseModel) -> dict[str, Any]:
+        parsed = SearchCourseMaterialArgs.model_validate(args)
+        pack = build_context(
+            self.repo,
+            self.user.user_id,
+            parsed.query,
+            course_id=parsed.course_id,
+            source_types=parsed.source_types,
+            k=parsed.k,
+            max_tokens=3000,
+        )
+        blocks_data = [
+            {
+                "block_id": b.block_id,
+                "course": b.course_name,
+                "file": b.filename,
+                "location": b.location_label,
+                "text": b.text,
+            }
+            for b in pack.blocks
+        ]
+        return {
+            "coverage": pack.coverage,
+            "blocks_count": len(blocks_data),
+            "blocks": blocks_data,
+            "note": (
+                "Se coverage for 'weak' ou 'none', declare na primeira linha que o assunto "
+                "completo não foi encontrado no material antes de qualquer complemento."
+                if pack.coverage in ("weak", "none")
+                else "Fundamente sua resposta citando a fonte exata (arquivo e página/slide)."
+            ),
+        }
+
+    def _get_file_chunks(self, args: BaseModel) -> dict[str, Any]:
+        parsed = GetFileChunksArgs.model_validate(args)
+        target_file_id = parsed.file_id
+        if target_file_id is None and parsed.filename:
+            files = self.repo.get_course_files(self.user.user_id, course_id=None)
+            candidates = [
+                f for f in files if parsed.filename.lower() in (f.get("display_name") or "").lower()
+            ]
+            if not candidates:
+                raise ToolError(f"Nenhum arquivo encontrado com o nome '{parsed.filename}'.")
+            if len(candidates) > 1:
+                cand_list = [f"{f['file_id']}: {f.get('display_name')}" for f in candidates[:5]]
+                raise ToolError(
+                    f"Mais de um arquivo corresponde a '{parsed.filename}': "
+                    f"{', '.join(cand_list)}. Especifique o file_id exato."
+                )
+            target_file_id = int(candidates[0]["file_id"])
+
+        if target_file_id is None:
+            raise ToolError("Especifique file_id ou filename para buscar o conteúdo do arquivo.")
+
+        chunks = self.repo.get_chunks_by_file(self.user.user_id, target_file_id)
+        if not chunks:
+            raise ToolError(f"Nenhum texto extraído encontrado para o arquivo {target_file_id}.")
+
+        if len(chunks) > 40 and parsed.location_start is None and parsed.location_end is None:
+            return {
+                "file_id": target_file_id,
+                "total_chunks": len(chunks),
+                "required_range": True,
+                "message": (
+                    f"Este arquivo é extenso ({len(chunks)} trechos). Forneça a faixa desejada "
+                    "(location_start e location_end), como páginas 10 a 20 ou slides 1 a 15."
+                ),
+            }
+
+        filtered = chunks
+        if parsed.location_start is not None or parsed.location_end is not None:
+            start_val = parsed.location_start or 1
+            end_val = parsed.location_end or 999999
+            filtered = [
+                c
+                for c in chunks
+                if not (
+                    c.get("location_end", 0) < start_val or c.get("location_start", 0) > end_val
+                )
+            ]
+
+        results = [
+            {
+                "chunk_index": c["chunk_index"],
+                "location_label": c["location_label"],
+                "text": c["text"],
+            }
+            for c in filtered[: parsed.limit]
+        ]
+        return {
+            "file_id": target_file_id,
+            "total_chunks": len(chunks),
+            "returned_chunks": len(results),
+            "chunks": results,
         }
 
     def _assignment_payload(self, row: dict[str, Any]) -> dict[str, Any]:

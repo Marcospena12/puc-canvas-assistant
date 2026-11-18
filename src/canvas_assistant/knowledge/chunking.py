@@ -85,7 +85,8 @@ def build_chunks(
     if not units:
         return []
 
-    raw_chunks: list[tuple[str, str, int, int, str]] = []
+    # Cada item em raw_chunks: (loc_type, loc_label, start_idx, end_idx, text, slide_nums)
+    raw_chunks: list[tuple[str, str, int, int, str, list[int]]] = []
     is_slide_doc = all(u.location_type == "slide" for u in units)
 
     if is_slide_doc:
@@ -108,7 +109,14 @@ def build_chunks(
                         label if total_pieces == 1 else f"{label} (parte {p_idx}/{total_pieces})"
                     )
                     raw_chunks.append(
-                        ("slide", p_label, current_slide_nums[0], current_slide_nums[-1], piece)
+                        (
+                            "slide",
+                            p_label,
+                            current_slide_nums[0],
+                            current_slide_nums[-1],
+                            piece,
+                            list(current_slide_nums),
+                        )
                     )
                 current_texts = [unit.text]
                 current_slide_nums = [unit.index_start]
@@ -126,7 +134,14 @@ def build_chunks(
             for p_idx, piece in enumerate(pieces, start=1):
                 p_label = label if total_pieces == 1 else f"{label} (parte {p_idx}/{total_pieces})"
                 raw_chunks.append(
-                    ("slide", p_label, current_slide_nums[0], current_slide_nums[-1], piece)
+                    (
+                        "slide",
+                        p_label,
+                        current_slide_nums[0],
+                        current_slide_nums[-1],
+                        piece,
+                        list(current_slide_nums),
+                    )
                 )
 
     else:
@@ -138,40 +153,61 @@ def build_chunks(
                 if total_pieces > 1:
                     label = f"{unit.label} (parte {part_idx}/{total_pieces})"
                 raw_chunks.append(
-                    (unit.location_type, label, unit.index_start, unit.index_end, piece)
+                    (unit.location_type, label, unit.index_start, unit.index_end, piece, [])
                 )
 
     # Mesclagem de chunks curtos (< MIN_CHUNK_CHARS) e descarte de ruído (< NOISE_CHUNK_CHARS)
-    merged_chunks: list[tuple[str, str, int, int, str]] = []
-    for loc_type, loc_label, start_idx, end_idx, text in raw_chunks:
+    # Regra estrita: teto de slides por chunk (max_slides) é inviolável.
+    # Mesclagem de curtos só ocorre se respeitar o teto de slides E o limite de caracteres.
+    merged_chunks: list[tuple[str, str, int, int, str, list[int]]] = []
+    for loc_type, loc_label, start_idx, end_idx, text, slide_nums in raw_chunks:
         # Se for minúsculo e primeiro elemento ou isolado, descartar ruído óbvio
         if len(text) < NOISE_CHUNK_CHARS and not merged_chunks:
             continue
 
         if merged_chunks:
-            prev_type, prev_label, prev_start, prev_end, prev_text = merged_chunks[-1]
-            # Se o anterior for muito curto, mescla com o atual se forem do mesmo tipo
-            if len(prev_text) < MIN_CHUNK_CHARS and prev_type == loc_type:
-                new_start = min(prev_start, start_idx)
-                new_end = max(prev_end, end_idx)
-                new_label = prev_label if prev_label == loc_label else f"{prev_label}; {loc_label}"
-                combined = f"{prev_text}\n\n{text}"
-                merged_chunks[-1] = (prev_type, new_label, new_start, new_end, combined)
-                continue
-            # Se o atual for muito curto, mescla para dentro do anterior se couber
-            if (
-                len(text) < MIN_CHUNK_CHARS
-                and prev_type == loc_type
-                and len(prev_text) + len(text) <= MAX_CHUNK_CHARS
-            ):
-                new_start = min(prev_start, start_idx)
-                new_end = max(prev_end, end_idx)
-                new_label = prev_label if prev_label == loc_label else f"{prev_label}; {loc_label}"
-                combined = f"{prev_text}\n\n{text}"
-                merged_chunks[-1] = (prev_type, new_label, new_start, new_end, combined)
-                continue
+            (
+                prev_type,
+                prev_label,
+                prev_start,
+                prev_end,
+                prev_text,
+                prev_slides,
+            ) = merged_chunks[-1]
 
-        merged_chunks.append((loc_type, loc_label, start_idx, end_idx, text))
+            if prev_type == loc_type:
+                combined_len = len(prev_text) + 2 + len(text)
+                merged_slides = sorted(set(prev_slides) | set(slide_nums))
+                slides_ok = (loc_type != "slide") or (len(merged_slides) <= max_slides)
+                chars_ok = combined_len <= MAX_CHUNK_CHARS
+
+                can_merge = (
+                    slides_ok
+                    and chars_ok
+                    and (len(prev_text) < MIN_CHUNK_CHARS or len(text) < MIN_CHUNK_CHARS)
+                )
+
+                if can_merge:
+                    new_start = min(prev_start, start_idx)
+                    new_end = max(prev_end, end_idx)
+                    if loc_type == "slide" and merged_slides:
+                        new_label = _format_slide_label(merged_slides)
+                    else:
+                        new_label = (
+                            prev_label if prev_label == loc_label else f"{prev_label}; {loc_label}"
+                        )
+                    combined = f"{prev_text}\n\n{text}"
+                    merged_chunks[-1] = (
+                        prev_type,
+                        new_label,
+                        new_start,
+                        new_end,
+                        combined,
+                        merged_slides,
+                    )
+                    continue
+
+        merged_chunks.append((loc_type, loc_label, start_idx, end_idx, text, slide_nums))
 
     # Filtro final de ruído residual que não pôde ser mesclado
     final_items = [
@@ -181,7 +217,7 @@ def build_chunks(
     ]
 
     result: list[Chunk] = []
-    for idx, (loc_type, loc_label, start_idx, end_idx, text) in enumerate(final_items, start=1):
+    for idx, (loc_type, loc_label, start_idx, end_idx, text, _) in enumerate(final_items, start=1):
         thash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         c_len = len(text)
         result.append(

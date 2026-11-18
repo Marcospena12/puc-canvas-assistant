@@ -99,7 +99,14 @@ class OpenAICompatProvider:
         response = await self.client.chat.completions.create(**payload)
         message = response.choices[0].message
         content = message.content or ""
-        return LLMResponse(text=str(content), tool_calls=self._parse_tool_calls(message))
+        in_tok = getattr(getattr(response, "usage", None), "prompt_tokens", 0) or 0
+        out_tok = getattr(getattr(response, "usage", None), "completion_tokens", 0) or 0
+        return LLMResponse(
+            text=str(content),
+            tool_calls=self._parse_tool_calls(message),
+            input_tokens=int(in_tok),
+            output_tokens=int(out_tok),
+        )
 
     async def aclose(self) -> None:
         await self.client.close()

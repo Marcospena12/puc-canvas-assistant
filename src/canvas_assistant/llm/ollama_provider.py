@@ -82,6 +82,7 @@ class OllamaProvider:
             "model": self.config.model,
             "messages": self._messages(messages),
             "stream": False,
+            "keep_alive": self.config.keep_alive,
             "options": {
                 "temperature": self.config.temperature,
                 "num_predict": self.config.max_tokens,
@@ -105,7 +106,23 @@ class OllamaProvider:
 
         message = _get(response, "message", response)
         content = _get(message, "content", "") or ""
-        return LLMResponse(text=str(content), tool_calls=self._parse_tool_calls(message))
+        thinking = _get(message, "thinking", "") or ""
+        in_tok = int(_get(response, "prompt_eval_count", 0) or 0)
+        out_tok = int(_get(response, "eval_count", 0) or 0)
+
+        def _duration_ms(key: str) -> int:
+            return int(int(_get(response, key, 0) or 0) / 1_000_000)
+
+        return LLMResponse(
+            text=str(content),
+            tool_calls=self._parse_tool_calls(message),
+            input_tokens=in_tok,
+            output_tokens=out_tok,
+            load_duration_ms=_duration_ms("load_duration"),
+            prompt_eval_duration_ms=_duration_ms("prompt_eval_duration"),
+            eval_duration_ms=_duration_ms("eval_duration"),
+            thinking_chars=len(str(thinking)),
+        )
 
     async def aclose(self) -> None:
         close = getattr(self.client, "aclose", None) or getattr(self.client, "close", None)

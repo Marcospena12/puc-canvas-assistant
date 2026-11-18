@@ -8,6 +8,7 @@ from typing import Any
 from ..textutil import short_course_name
 from ..urls import (
     extract_urls,
+    is_canvas_url,
     resource_ids_from_text,
     resource_ids_from_urls,
     urls_from_value,
@@ -64,7 +65,8 @@ def build_evidence(observations: list[ToolObservation], *, limit: int = 3000) ->
 
 def validate_answer(answer: str, allowed_urls: frozenset[str] | set[str]) -> set[str]:
     allowed = set(allowed_urls)
-    unknown = {url for url in extract_urls(answer) if url not in allowed}
+    # Valida apenas URLs do ecossistema do Canvas (evita falsos positivos em links externos)
+    unknown = {url for url in extract_urls(answer) if is_canvas_url(url) and url not in allowed}
     allowed_ids = resource_ids_from_urls(allowed)
     for resource_id in resource_ids_from_text(answer):
         if resource_id not in allowed_ids:

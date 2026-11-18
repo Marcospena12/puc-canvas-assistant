@@ -42,6 +42,8 @@ class Assignment:
     late: bool
     missing: bool
     excused: bool
+    description_html: str | None = None
+    rubric: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(slots=True)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Sequence
 from contextlib import closing
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .db import Database
@@ -106,6 +106,8 @@ class Repository:
                 a.unlock_at,
                 a.points_possible,
                 _json(a.submission_types),
+                a.description_html,
+                _json(a.rubric),
                 _bool(a.is_quiz),
                 a.html_url,
                 _bool(a.published),
@@ -130,10 +132,11 @@ class Repository:
                 """
                 INSERT INTO assignments (
                     user_id, id, course_id, name, due_at, lock_at, unlock_at,
-                    points_possible, submission_types_json, is_quiz, html_url,
+                    points_possible, submission_types_json, description_html, rubric_json,
+                    is_quiz, html_url,
                     published, submission_state, submission_score, submission_grade,
                     submitted_at, graded_at, late, missing, excused, synced_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 rows,
             )
@@ -1190,41 +1193,353 @@ class Repository:
         chunks: list[dict[str, Any]],
     ) -> None:
         now = _now_iso()
-        rows = [
-            (
-                user_id,
-                course_id,
-                file_id,
-                sha256,
-                c["chunk_index"],
-                c["location_type"],
-                c["location_label"],
-                c.get("location_start"),
-                c.get("location_end"),
-                c["text"],
-                c["text_hash"],
-                c["char_count"],
-                c["token_estimate"],
-                now,
-            )
-            for c in chunks
-        ]
         with closing(self.db.connect()) as conn, conn:
             conn.execute(
-                "DELETE FROM file_chunks WHERE user_id = ? AND file_id = ?",
-                (user_id, file_id),
+                "DELETE FROM file_chunks WHERE user_id = ? AND course_id = ? "
+                "AND source_type = 'arquivo' AND source_ref = ?",
+                (user_id, course_id, str(file_id)),
             )
-            if rows:
+            f_row = conn.execute(
+                "SELECT display_name FROM file_sync_state WHERE user_id = ? AND file_id = ?",
+                (user_id, file_id),
+            ).fetchone()
+            title = (
+                str(f_row["display_name"])
+                if f_row and f_row["display_name"]
+                else f"Arquivo_{file_id}"
+            )
+
+            if chunks:
+                rows = [
+                    (
+                        user_id,
+                        course_id,
+                        file_id,
+                        sha256,
+                        "arquivo",
+                        str(file_id),
+                        title,
+                        c["chunk_index"],
+                        c["location_type"],
+                        c["location_label"],
+                        c.get("location_start"),
+                        c.get("location_end"),
+                        c["text"],
+                        c["text_hash"],
+                        c["char_count"],
+                        c["token_estimate"],
+                        now,
+                    )
+                    for c in chunks
+                ]
                 conn.executemany(
                     """
                     INSERT INTO file_chunks (
-                        user_id, course_id, file_id, sha256, chunk_index, location_type,
-                        location_label, location_start, location_end, text, text_hash,
-                        char_count, token_estimate, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        user_id, course_id, file_id, sha256, source_type, source_ref, title,
+                        chunk_index, location_type, location_label, location_start, location_end,
+                        text, text_hash, char_count, token_estimate, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     rows,
                 )
+
+    def replace_content_chunks(
+        self,
+        user_id: str,
+        course_id: int,
+        source_type: str,
+        source_ref: str,
+        title: str,
+        chunks: list[dict[str, Any]],
+        *,
+        due_at: str | None = None,
+    ) -> None:
+        now = _now_iso()
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM file_chunks "
+                "WHERE user_id = ? AND course_id = ? AND source_type = ? AND source_ref = ?",
+                (user_id, course_id, source_type, source_ref),
+            )
+            if chunks:
+                rows = [
+                    (
+                        user_id,
+                        course_id,
+                        0,
+                        "",
+                        source_type,
+                        source_ref,
+                        title,
+                        c["chunk_index"],
+                        c["location_type"],
+                        c["location_label"],
+                        c.get("location_start"),
+                        c.get("location_end"),
+                        c["text"],
+                        c["text_hash"],
+                        c["char_count"],
+                        c["token_estimate"],
+                        due_at,
+                        now,
+                    )
+                    for c in chunks
+                ]
+                conn.executemany(
+                    """
+                    INSERT INTO file_chunks (
+                        user_id, course_id, file_id, sha256, source_type, source_ref, title,
+                        chunk_index, location_type, location_label, location_start, location_end,
+                        text, text_hash, char_count, token_estimate, due_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+
+    def delete_content_chunks(
+        self, user_id: str, course_id: int, source_type: str, source_ref: str
+    ) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                "DELETE FROM file_chunks "
+                "WHERE user_id = ? AND course_id = ? AND source_type = ? AND source_ref = ?",
+                (user_id, course_id, source_type, source_ref),
+            )
+
+    def get_canvas_content_state(
+        self, user_id: str, course_id: int, source_type: str, source_ref: str
+    ) -> dict[str, Any] | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM canvas_content_state
+                WHERE user_id = ? AND course_id = ? AND source_type = ? AND source_ref = ?
+                """,
+                (user_id, course_id, source_type, source_ref),
+            ).fetchone()
+            return dict(row) if row else None
+
+    def upsert_canvas_content_state(self, user_id: str, row: dict[str, Any]) -> None:
+        now = _now_iso()
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO canvas_content_state (
+                    user_id, course_id, source_type, source_ref, title, content_hash,
+                    canvas_file_ids_json, due_at, active, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, course_id, source_type, source_ref) DO UPDATE SET
+                    title = excluded.title,
+                    content_hash = excluded.content_hash,
+                    canvas_file_ids_json = excluded.canvas_file_ids_json,
+                    due_at = excluded.due_at,
+                    active = excluded.active,
+                    synced_at = excluded.synced_at
+                """,
+                (
+                    user_id,
+                    row["course_id"],
+                    row["source_type"],
+                    row["source_ref"],
+                    row["title"],
+                    row["content_hash"],
+                    row.get("canvas_file_ids_json") or "[]",
+                    row.get("due_at"),
+                    _bool(bool(row.get("active", True))),
+                    now,
+                ),
+            )
+
+    def mark_missing_content_inactive(
+        self,
+        user_id: str,
+        course_id: int,
+        source_type: str,
+        active_refs: set[str],
+        *,
+        prefix: str | None = None,
+        not_prefix: str | None = None,
+    ) -> list[str]:
+        now = _now_iso()
+        removed_refs: list[str] = []
+        where = ["user_id = ?", "course_id = ?", "source_type = ?", "active = 1"]
+        params: list[Any] = [user_id, course_id, source_type]
+        if prefix:
+            where.append("source_ref LIKE ?")
+            params.append(f"{prefix}%")
+        if not_prefix:
+            where.append("source_ref NOT LIKE ?")
+            params.append(f"{not_prefix}%")
+
+        with closing(self.db.connect()) as conn, conn:
+            rows = conn.execute(
+                f"SELECT source_ref FROM canvas_content_state WHERE {' AND '.join(where)}",
+                params,
+            ).fetchall()
+            for r in rows:
+                ref = str(r["source_ref"])
+                if ref not in active_refs:
+                    removed_refs.append(ref)
+                    conn.execute(
+                        "UPDATE canvas_content_state SET active = 0, synced_at = ? "
+                        "WHERE user_id = ? AND course_id = ? "
+                        "AND source_type = ? AND source_ref = ?",
+                        (now, user_id, course_id, source_type, ref),
+                    )
+                    conn.execute(
+                        "DELETE FROM file_chunks "
+                        "WHERE user_id = ? AND course_id = ? "
+                        "AND source_type = ? AND source_ref = ?",
+                        (user_id, course_id, source_type, ref),
+                    )
+        return removed_refs
+
+    def get_content_sync_state(
+        self, user_id: str, course_id: int, resource: str
+    ) -> dict[str, Any] | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM content_sync_state
+                WHERE user_id = ? AND course_id = ? AND resource = ?
+                """,
+                (user_id, course_id, resource),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def set_content_sync_status(
+        self,
+        user_id: str,
+        course_id: int,
+        resource: str,
+        status: str,
+        *,
+        error: str | None = None,
+        retry_at: str | None = None,
+        success: bool = False,
+    ) -> None:
+        now = _now_iso()
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO content_sync_state (
+                    user_id, course_id, resource, status, error, retry_at,
+                    last_attempt_at, last_success_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (user_id, course_id, resource) DO UPDATE SET
+                    status = excluded.status,
+                    error = excluded.error,
+                    retry_at = excluded.retry_at,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = COALESCE(excluded.last_success_at, last_success_at),
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    user_id,
+                    course_id,
+                    resource,
+                    status,
+                    error,
+                    retry_at,
+                    now,
+                    now if success else None,
+                    now,
+                ),
+            )
+
+    def clear_content_retries(self, user_id: str) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                UPDATE content_sync_state
+                SET retry_at = NULL, updated_at = ?
+                WHERE user_id = ? AND retry_at IS NOT NULL
+                """,
+                (_now_iso(), user_id),
+            )
+
+    def get_assignment_detail(self, user_id: str, assignment_id: int) -> dict[str, Any] | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT a.*, c.name AS course_name
+                FROM assignments a
+                JOIN courses c ON c.user_id = a.user_id AND c.id = a.course_id
+                WHERE a.user_id = ? AND a.id = ? AND a.published = 1 AND c.active = 1
+                """,
+                (user_id, assignment_id),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_pending_assignments(
+        self, user_id: str, *, course_ids: list[int] | None = None
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "a.user_id = ?",
+            "a.published = 1",
+            "c.active = 1",
+            "a.submitted_at IS NULL",
+            "a.excused = 0",
+        ]
+        params: list[Any] = [user_id]
+        if course_ids is not None:
+            if not course_ids:
+                return []
+            placeholders = ",".join("?" for _ in course_ids)
+            clauses.append(f"a.course_id IN ({placeholders})")
+            params.extend(course_ids)
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT a.*, c.name AS course_name
+                FROM assignments a
+                JOIN courses c ON c.user_id = a.user_id AND c.id = a.course_id
+                WHERE {" AND ".join(clauses)}
+                ORDER BY (a.due_at IS NULL), a.due_at ASC, a.name COLLATE NOCASE
+                """,
+                params,
+            ).fetchall()
+        return _rows(rows)
+
+    def get_briefing_cache(self, cache_key: str) -> str | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                "SELECT briefing_text FROM briefing_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+        return str(row["briefing_text"]) if row else None
+
+    def save_briefing_cache(
+        self,
+        cache_key: str,
+        *,
+        user_id: str,
+        assignment_id: int,
+        content_hash: str,
+        prompt_version: str,
+        briefing_text: str,
+    ) -> None:
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO briefing_cache (
+                    cache_key, user_id, assignment_id, content_hash,
+                    prompt_version, briefing_text, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    briefing_text = excluded.briefing_text,
+                    created_at = excluded.created_at
+                """,
+                (
+                    cache_key,
+                    user_id,
+                    assignment_id,
+                    content_hash,
+                    prompt_version,
+                    briefing_text,
+                    _now_iso(),
+                ),
+            )
 
     def delete_file_chunks(self, user_id: str, file_id: int) -> None:
         with closing(self.db.connect()) as conn, conn:
@@ -1257,6 +1572,46 @@ class Repository:
                 (sha256,),
             ).fetchall()
         return _rows(rows)
+
+    def get_chunks_by_content(
+        self, user_id: str, course_id: int, source_type: str, source_ref: str
+    ) -> list[dict[str, Any]]:
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM file_chunks
+                WHERE user_id = ? AND course_id = ? AND source_type = ? AND source_ref = ?
+                ORDER BY chunk_index ASC
+                """,
+                (user_id, course_id, source_type, source_ref),
+            ).fetchall()
+        return _rows(rows)
+
+    def list_all_content_items(
+        self, user_id: str, course_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        clauses = ["user_id = ?", "active = 1"]
+        params: list[Any] = [user_id]
+        if course_id is not None:
+            clauses.append("course_id = ?")
+            params.append(course_id)
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    course_id,
+                    source_type,
+                    source_ref,
+                    title,
+                    content_hash,
+                    due_at
+                FROM canvas_content_state
+                WHERE {" AND ".join(clauses)}
+                ORDER BY title COLLATE NOCASE
+                """,
+                params,
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def copy_chunks_for_file(
         self,
@@ -1345,15 +1700,8 @@ class Repository:
             conn.execute("DELETE FROM chunks_fts")
             cursor = conn.execute(
                 """
-                INSERT INTO chunks_fts(rowid, filename, location_label, text)
-                SELECT
-                    fc.id,
-                    COALESCE(fs.display_name, ''),
-                    fc.location_label,
-                    fc.text
-                FROM file_chunks fc
-                LEFT JOIN file_sync_state fs
-                    ON fs.user_id = fc.user_id AND fs.file_id = fc.file_id
+                INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+                SELECT id, title, location_label, text, source_type FROM file_chunks
                 """
             )
             total_chunks = conn.execute("SELECT count(*) FROM file_chunks").fetchone()[0]
@@ -1419,7 +1767,10 @@ class Repository:
                 """,
                 (user_id, file_id, start_idx, end_idx),
             ).fetchall()
-            return _rows(rows)
+        return _rows(rows)
+
+    def get_course_files(self, user_id: str, course_id: int | None = None) -> list[dict[str, Any]]:
+        return self.get_file_sync_state(user_id, course_id=course_id)
 
     def knowledge_stats(self, user_id: str) -> dict[str, Any]:
         consistency = self.fts_consistency_check()
@@ -1515,3 +1866,101 @@ class Repository:
             "max_chars": max_chars,
             "fts_consistency": consistency,
         }
+
+    # ----------------------------- study cache & usage -----------------------------
+
+    def get_study_cache(self, cache_key: str) -> str | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                "SELECT summary_text FROM study_cache WHERE cache_key = ?",
+                (cache_key,),
+            ).fetchone()
+            return str(row["summary_text"]) if row else None
+
+    def save_study_cache(
+        self,
+        cache_key: str,
+        file_sha256: str,
+        location_range: str,
+        prompt_version: str,
+        summary_text: str,
+    ) -> None:
+        now_iso = _now_iso()
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO study_cache (
+                    cache_key, file_sha256, location_range, prompt_version, summary_text, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(cache_key) DO UPDATE SET
+                    summary_text = excluded.summary_text,
+                    created_at = excluded.created_at
+                """,
+                (cache_key, file_sha256, location_range, prompt_version, summary_text, now_iso),
+            )
+
+    def record_study_usage(
+        self,
+        user_id: str,
+        command: str,
+        input_tokens: int,
+        output_tokens: int,
+        context_blocks: int,
+        latency_ms: int,
+    ) -> None:
+        now_iso = _now_iso()
+        with closing(self.db.connect()) as conn, conn:
+            conn.execute(
+                """
+                INSERT INTO study_usage (
+                    user_id, command, input_tokens, output_tokens,
+                    context_blocks, latency_ms, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    command,
+                    input_tokens,
+                    output_tokens,
+                    context_blocks,
+                    latency_ms,
+                    now_iso,
+                ),
+            )
+
+    def get_study_usage_summary(self, user_id: str, days: int = 7) -> list[dict[str, Any]]:
+        cutoff = (datetime.now(UTC) - timedelta(days=days)).isoformat(timespec="seconds")
+        with closing(self.db.connect()) as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    command,
+                    COUNT(*) AS executions,
+                    SUM(input_tokens) AS total_input_tokens,
+                    SUM(output_tokens) AS total_output_tokens,
+                    AVG(latency_ms) AS avg_latency_ms
+                FROM study_usage
+                WHERE user_id = ? AND created_at >= ?
+                GROUP BY command
+                ORDER BY command
+                """,
+                (user_id, cutoff),
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def get_latest_study_usage(self, user_id: str) -> dict[str, Any] | None:
+        with closing(self.db.connect()) as conn:
+            row = conn.execute(
+                """
+                SELECT command, input_tokens, output_tokens, context_blocks,
+                       latency_ms, created_at
+                FROM study_usage
+                WHERE user_id = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (user_id,),
+            ).fetchone()
+            return dict(row) if row else None

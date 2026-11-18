@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import logging
 import re
 from dataclasses import dataclass, field
@@ -124,9 +125,70 @@ def parse_course(raw: dict[str, Any], tabs: list[dict[str, Any]]) -> Course:
     )
 
 
+def _html_to_text(value: str | None) -> str:
+    if not value:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>|</p>|</li>|</div>", "\n", value)
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = html.unescape(text).replace("\xa0", " ")
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+
+def extract_rubric_from_description(description_html: str | None) -> list[dict[str, Any]]:
+    """Extrai critérios no formato 'Critério (X pts)' quando a API não envia rubric."""
+    text = _html_to_text(description_html)
+    if not text:
+        return []
+    marker = re.search(r"(?i)(crit[eé]rios de avalia[cç][aã]o|rubrica)", text)
+    section = text[marker.start() :] if marker else text
+    criteria: list[dict[str, Any]] = []
+    for line in section.splitlines():
+        stripped = line.strip(" \t-•*")
+        if not stripped:
+            continue
+        match = re.search(
+            r"(?i)^(.+?)\s*(?:[\(\[]\s*(\d+(?:[.,]\d+)?)\s*(?:pts?|pontos?)\s*[\)\]]|[-–—:]\s*(\d+(?:[.,]\d+)?)\s*(?:pts?|pontos?))",
+            stripped,
+        )
+        if not match:
+            continue
+        criterion = match.group(1).strip(" :–—-")
+        points = match.group(2) or match.group(3)
+        if not criterion:
+            continue
+        criteria.append(
+            {
+                "criterion": criterion,
+                "points": float(points.replace(",", ".")),
+                "description": "",
+            }
+        )
+    return criteria
+
+
+def normalize_rubric(raw: Any, description_html: str | None) -> list[dict[str, Any]]:
+    criteria: list[dict[str, Any]] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            criterion = _html_to_text(str(item.get("description") or item.get("criterion") or ""))
+            if not criterion:
+                continue
+            criteria.append(
+                {
+                    "criterion": criterion,
+                    "points": _as_float(item.get("points")),
+                    "description": _html_to_text(str(item.get("long_description") or "")),
+                }
+            )
+    return criteria or extract_rubric_from_description(description_html)
+
+
 def parse_assignment(raw: dict[str, Any], course_id: int) -> Assignment:
     submission = raw.get("submission") or {}
     submission_types = [str(t) for t in (raw.get("submission_types") or [])]
+    description_html = raw.get("description")
     return Assignment(
         id=int(raw["id"]),
         course_id=course_id,
@@ -149,6 +211,8 @@ def parse_assignment(raw: dict[str, Any], course_id: int) -> Assignment:
         late=_as_bool(submission.get("late")),
         missing=_as_bool(submission.get("missing")),
         excused=_as_bool(submission.get("excused")),
+        description_html=description_html,
+        rubric=normalize_rubric(raw.get("rubric"), description_html),
     )
 
 

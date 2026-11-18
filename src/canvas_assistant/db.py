@@ -39,6 +39,8 @@ CREATE TABLE IF NOT EXISTS assignments (
     unlock_at TEXT,
     points_possible REAL,
     submission_types_json TEXT NOT NULL DEFAULT '[]',
+    description_html TEXT,
+    rubric_json TEXT NOT NULL DEFAULT '[]',
     is_quiz INTEGER NOT NULL DEFAULT 0,
     html_url TEXT,
     published INTEGER NOT NULL DEFAULT 1,
@@ -245,8 +247,11 @@ CREATE TABLE IF NOT EXISTS file_chunks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
     course_id INTEGER NOT NULL,
-    file_id INTEGER NOT NULL,
-    sha256 TEXT NOT NULL,
+    file_id INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL DEFAULT 'arquivo',
+    source_ref TEXT NOT NULL DEFAULT '',
+    title TEXT NOT NULL DEFAULT '',
     chunk_index INTEGER NOT NULL,
     location_type TEXT NOT NULL, -- pagina, slide, secao, etc.
     location_label TEXT NOT NULL, -- ex.: 'Página 3', 'Slides 4-6', 'Seção 1'
@@ -256,39 +261,29 @@ CREATE TABLE IF NOT EXISTS file_chunks (
     text_hash TEXT NOT NULL,
     char_count INTEGER NOT NULL,
     token_estimate INTEGER NOT NULL,
+    due_at TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (user_id, course_id) REFERENCES courses (user_id, id) ON DELETE CASCADE,
-    FOREIGN KEY (user_id, file_id) REFERENCES file_sync_state (user_id, file_id) ON DELETE CASCADE,
-    FOREIGN KEY (sha256) REFERENCES extracted_content (sha256) ON DELETE CASCADE,
-    UNIQUE (user_id, file_id, chunk_index)
+    UNIQUE (user_id, course_id, source_type, source_ref, chunk_index)
 );
 CREATE INDEX IF NOT EXISTS idx_file_chunks_lookup
-    ON file_chunks (user_id, course_id, file_id);
+    ON file_chunks (user_id, course_id, source_type, source_ref);
 CREATE INDEX IF NOT EXISTS idx_file_chunks_sha256
     ON file_chunks (sha256);
+CREATE INDEX IF NOT EXISTS idx_file_chunks_type
+    ON file_chunks (user_id, course_id, source_type);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-    filename,
+    title,
     location_label,
     text,
+    source_type UNINDEXED,
     tokenize='unicode61 remove_diacritics 2'
 );
 
 CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON file_chunks BEGIN
-    INSERT INTO chunks_fts(rowid, filename, location_label, text)
-    VALUES (
-        new.id,
-        COALESCE(
-            (
-                SELECT display_name
-                FROM file_sync_state
-                WHERE user_id = new.user_id AND file_id = new.file_id
-            ),
-            ''
-        ),
-        new.location_label,
-        new.text
-    );
+    INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+    VALUES (new.id, new.title, new.location_label, new.text, new.source_type);
 END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON file_chunks BEGIN
@@ -297,24 +292,86 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON file_chunks BEGIN
     DELETE FROM chunks_fts WHERE rowid = old.id;
-    INSERT INTO chunks_fts(rowid, filename, location_label, text)
-    VALUES (
-        new.id,
-        COALESCE(
-            (
-                SELECT display_name
-                FROM file_sync_state
-                WHERE user_id = new.user_id AND file_id = new.file_id
-            ),
-            ''
-        ),
-        new.location_label,
-        new.text
-    );
+    INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+    VALUES (new.id, new.title, new.location_label, new.text, new.source_type);
 END;
+
+CREATE TABLE IF NOT EXISTS canvas_content_state (
+    user_id TEXT NOT NULL,
+    course_id INTEGER NOT NULL,
+    source_type TEXT NOT NULL,
+    source_ref TEXT NOT NULL,
+    title TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    canvas_file_ids_json TEXT NOT NULL DEFAULT '[]',
+    due_at TEXT,
+    active INTEGER NOT NULL DEFAULT 1,
+    synced_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, course_id, source_type, source_ref),
+    FOREIGN KEY (user_id, course_id) REFERENCES courses (user_id, id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_canvas_content_lookup
+    ON canvas_content_state (user_id, course_id, source_type);
+
+CREATE TABLE IF NOT EXISTS content_sync_state (
+    user_id TEXT NOT NULL,
+    course_id INTEGER NOT NULL,
+    resource TEXT NOT NULL, -- pagina, tarefa, aviso, ementa, quiz
+    status TEXT NOT NULL DEFAULT 'unknown',
+    error TEXT,
+    retry_at TEXT,
+    last_attempt_at TEXT,
+    last_success_at TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (user_id, course_id, resource),
+    FOREIGN KEY (user_id, course_id) REFERENCES courses (user_id, id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS briefing_cache (
+    cache_key TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    assignment_id INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    briefing_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS study_cache (
+    cache_key TEXT PRIMARY KEY,
+    file_sha256 TEXT NOT NULL,
+    location_range TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    summary_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS study_usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    command TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    context_blocks INTEGER NOT NULL,
+    latency_ms INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_study_usage_user_created ON study_usage (user_id, created_at);
+
+CREATE TABLE IF NOT EXISTS review_cache (
+    cache_key TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    assignment_id INTEGER NOT NULL,
+    draft_hash TEXT NOT NULL,
+    rubric_hash TEXT NOT NULL,
+    prompt_version TEXT NOT NULL,
+    feedback_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_cache_user ON review_cache (user_id, created_at);
 """
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 
 
 class Database:
@@ -331,7 +388,7 @@ class Database:
 
     def _migrate(self, conn: sqlite3.Connection) -> None:
         files_cols = {row["name"] for row in conn.execute("PRAGMA table_info(files)").fetchall()}
-        if "folder_id" not in files_cols:
+        if files_cols and "folder_id" not in files_cols:
             conn.execute("ALTER TABLE files ADD COLUMN folder_id INTEGER")
 
         ext_cols = {
@@ -343,29 +400,177 @@ class Database:
                 "ADD COLUMN empty_units_count INTEGER NOT NULL DEFAULT 0"
             )
 
-        # Garante população do FTS5 caso já existam chunks sem indexação
-        fts_count = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
-        chunks_count = conn.execute("SELECT count(*) FROM file_chunks").fetchone()[0]
-        if chunks_count > 0 and fts_count == 0:
+        assignment_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(assignments)").fetchall()
+        }
+        if assignment_cols and "description_html" not in assignment_cols:
+            conn.execute("ALTER TABLE assignments ADD COLUMN description_html TEXT")
+        if assignment_cols and "rubric_json" not in assignment_cols:
+            conn.execute(
+                "ALTER TABLE assignments ADD COLUMN rubric_json TEXT NOT NULL DEFAULT '[]'"
+            )
+
+        # Migração v5 -> v6: generalização de chunks para qualquer tipo de conteúdo
+        chunk_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(file_chunks)").fetchall()
+        }
+        chunk_indices = conn.execute("PRAGMA index_list(file_chunks)").fetchall()
+        has_course_in_unique = False
+        for idx_row in chunk_indices:
+            if idx_row["unique"]:
+                cols = [
+                    c["name"]
+                    for c in conn.execute(f"PRAGMA index_info({idx_row['name']})").fetchall()
+                ]
+                if "course_id" in cols and "source_type" in cols:
+                    has_course_in_unique = True
+                    break
+
+        if chunk_cols and (not has_course_in_unique or "source_type" not in chunk_cols):
+            conn.execute("PRAGMA foreign_keys = OFF")
             conn.execute(
                 """
-                INSERT INTO chunks_fts(rowid, filename, location_label, text)
-                SELECT
-                    fc.id,
-                    COALESCE(fs.display_name, ''),
-                    fc.location_label,
-                    fc.text
-                FROM file_chunks fc
-                LEFT JOIN file_sync_state fs
-                    ON fs.user_id = fc.user_id AND fs.file_id = fc.file_id
+                CREATE TABLE IF NOT EXISTS file_chunks_v6 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id TEXT NOT NULL,
+                    course_id INTEGER NOT NULL,
+                    file_id INTEGER NOT NULL DEFAULT 0,
+                    sha256 TEXT NOT NULL DEFAULT '',
+                    source_type TEXT NOT NULL DEFAULT 'arquivo',
+                    source_ref TEXT NOT NULL DEFAULT '',
+                    title TEXT NOT NULL DEFAULT '',
+                    chunk_index INTEGER NOT NULL,
+                    location_type TEXT NOT NULL,
+                    location_label TEXT NOT NULL,
+                    location_start INTEGER,
+                    location_end INTEGER,
+                    text TEXT NOT NULL,
+                    text_hash TEXT NOT NULL,
+                    char_count INTEGER NOT NULL,
+                    token_estimate INTEGER NOT NULL,
+                    due_at TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (user_id, course_id)
+                        REFERENCES courses (user_id, id) ON DELETE CASCADE,
+                    UNIQUE (user_id, course_id, source_type, source_ref, chunk_index)
+                )
                 """
             )
+            if "source_type" in chunk_cols:
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO file_chunks_v6 (
+                        id, user_id, course_id, file_id, sha256, source_type, source_ref, title,
+                        chunk_index, location_type, location_label, location_start, location_end,
+                        text, text_hash, char_count, token_estimate, due_at, created_at
+                    )
+                    SELECT
+                        id, user_id, course_id, file_id, sha256, source_type, source_ref, title,
+                        chunk_index, location_type, location_label, location_start, location_end,
+                        text, text_hash, char_count, token_estimate, due_at, created_at
+                    FROM file_chunks
+                    """
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO file_chunks_v6 (
+                        id, user_id, course_id, file_id, sha256, source_type, source_ref, title,
+                        chunk_index, location_type, location_label, location_start, location_end,
+                        text, text_hash, char_count, token_estimate, due_at, created_at
+                    )
+                    SELECT
+                        fc.id, fc.user_id, fc.course_id, fc.file_id, fc.sha256,
+                        'arquivo', CAST(fc.file_id AS TEXT),
+                        COALESCE(fs.display_name, ''),
+                        fc.chunk_index, fc.location_type, fc.location_label,
+                        fc.location_start, fc.location_end,
+                        fc.text, fc.text_hash, fc.char_count, fc.token_estimate, NULL, fc.created_at
+                    FROM file_chunks fc
+                    LEFT JOIN file_sync_state fs
+                        ON fs.user_id = fc.user_id AND fs.file_id = fc.file_id
+                    """
+                )
+            conn.execute("DROP TRIGGER IF EXISTS chunks_ai")
+            conn.execute("DROP TRIGGER IF EXISTS chunks_ad")
+            conn.execute("DROP TRIGGER IF EXISTS chunks_au")
+            conn.execute("DROP TABLE IF EXISTS chunks_fts")
+            conn.execute("DROP TABLE file_chunks")
+            conn.execute("ALTER TABLE file_chunks_v6 RENAME TO file_chunks")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_chunks_lookup "
+                "ON file_chunks (user_id, course_id, source_type, source_ref)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_chunks_sha256 ON file_chunks (sha256)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_file_chunks_type "
+                "ON file_chunks (user_id, course_id, source_type)"
+            )
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+                    title,
+                    location_label,
+                    text,
+                    source_type UNINDEXED,
+                    tokenize='unicode61 remove_diacritics 2'
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+                SELECT id, title, location_label, text, source_type FROM file_chunks
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON file_chunks BEGIN
+                    INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+                    VALUES (new.id, new.title, new.location_label, new.text, new.source_type);
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON file_chunks BEGIN
+                    DELETE FROM chunks_fts WHERE rowid = old.id;
+                END;
+                """
+            )
+            conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON file_chunks BEGIN
+                    DELETE FROM chunks_fts WHERE rowid = old.id;
+                    INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+                    VALUES (new.id, new.title, new.location_label, new.text, new.source_type);
+                END;
+                """
+            )
+            conn.execute("PRAGMA foreign_keys = ON")
+
+        # Garante população do FTS5 caso já existam chunks sem indexação
+        fts_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='chunks_fts'"
+        ).fetchone()
+        if fts_table and chunk_cols:
+            fts_count = conn.execute("SELECT count(*) FROM chunks_fts").fetchone()[0]
+            chunks_count = conn.execute("SELECT count(*) FROM file_chunks").fetchone()[0]
+            if chunks_count > 0 and fts_count == 0:
+                conn.execute(
+                    """
+                    INSERT INTO chunks_fts(rowid, title, location_label, text, source_type)
+                    SELECT id, title, location_label, text, source_type FROM file_chunks
+                    """
+                )
 
     def initialize(self) -> None:
         with self.connect() as conn:
             conn.execute("PRAGMA journal_mode = WAL")
-            conn.executescript(SCHEMA_SQL)
             self._migrate(conn)
+            conn.executescript(SCHEMA_SQL)
             conn.execute(
                 "INSERT INTO schema_meta (key, value) VALUES ('version', ?) "
                 "ON CONFLICT (key) DO UPDATE SET value = excluded.value",

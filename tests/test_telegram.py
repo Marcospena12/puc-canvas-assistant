@@ -108,6 +108,30 @@ async def test_on_text_passes_user_to_handler_and_replies() -> None:
     assert replies == ["resposta"]
 
 
+async def test_unauthorized_user_message_is_silently_ignored() -> None:
+    calls: list[tuple[UserProfile, str]] = []
+    replies: list[str] = []
+
+    async def handler(user: UserProfile, text: str) -> str:
+        calls.append((user, text))
+        return "resposta"
+
+    async def reply_text(text: str, **kwargs) -> None:
+        replies.append(text)
+
+    channel = make_channel(allowed_user_ids=frozenset({10, 20}), on_message=handler)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=999),  # Usuário não autorizado
+        effective_chat=SimpleNamespace(id=10),
+        effective_message=SimpleNamespace(text="quero colar na prova", reply_text=reply_text),
+    )
+
+    await channel._on_text(update, None)
+
+    assert calls == []
+    assert replies == []
+
+
 async def test_send_message_returns_true_and_uses_html() -> None:
     sent: list[dict] = []
 
@@ -133,6 +157,27 @@ async def test_send_message_returns_false_on_error() -> None:
     channel.app = SimpleNamespace(bot=SimpleNamespace(send_message=bot_send_message))
 
     assert await channel.send_message(channel.user, "oi") is False
+
+
+async def test_health_command_calls_handler() -> None:
+    replies: list[str] = []
+
+    async def reply_text(text: str, **kwargs) -> None:
+        replies.append(text)
+
+    async def on_health() -> str:
+        return "diagnóstico ok"
+
+    channel = make_channel(on_health=on_health)
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=20),
+        effective_chat=SimpleNamespace(id=10),
+        effective_message=SimpleNamespace(reply_text=reply_text),
+    )
+
+    await channel._cmd_health(update, None)
+
+    assert replies == ["diagnóstico ok"]
 
 
 async def test_testnotify_command_calls_handler() -> None:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 
-from canvas_assistant.agent.agent import FALLBACK_ANSWER, Agent
+from canvas_assistant.agent.agent import FALLBACK_ANSWER, Agent, classify_message_intent
 from canvas_assistant.agent.tools import ToolRegistry
 from canvas_assistant.llm.base import LLMResponse, Message, ToolCall, ToolSpec
 from canvas_assistant.timeutil import to_utc_iso, utc_now
@@ -26,6 +26,21 @@ class FakeProvider:
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+def test_classifier_hard_cases() -> None:
+    cases = {
+        "quando é a prova de BI?": "deadlines",
+        "o que é média ponderada?": "study",
+        "tenho trabalho de react pra quando?": "deadlines",
+        "tô atrasado em alguma coisa?": "deadlines",
+        "quanto falta pra eu passar em BI?": "grades",
+        "qual minha média em BI?": "grades",
+        "quais matérias estou cursando?": "courses",
+        "obrigado!": "conversational",
+    }
+    for text, expected in cases.items():
+        assert classify_message_intent(text) == expected, text
 
 
 def seed(repo, user, course, assignment) -> None:

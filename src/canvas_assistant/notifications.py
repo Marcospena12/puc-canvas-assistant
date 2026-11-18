@@ -12,7 +12,7 @@ from .config import NotificationConfig, UserProfile
 from .htmltext import html_to_text
 from .repository import Repository
 from .textutil import short_course_name
-from .timeutil import WEEKDAYS_PT, format_local, parse_dt, to_utc_iso, utc_now
+from .timeutil import WEEKDAYS_PT, format_local, local_now, parse_dt, to_utc_iso, utc_now
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +256,35 @@ class NotificationService:
         ]
         return 1 if await self._send("\n".join(lines), events) else 0
 
+    async def send_content_events(self, events: Sequence[Any]) -> int:
+        if not self.config.enabled or not events:
+            return 0
+        if self.is_quiet(local_now(self.tz)):
+            return 0
+
+        sent_count = 0
+        for ev in events:
+            if getattr(ev, "event_type", None) == "new_page" and self.config.new_pages:
+                key = f"new_page:{ev.course_id}:{ev.ref}"
+                if self.repo.has_notification_event(self.user.user_id, key):
+                    continue
+                text = f"Nova página em <b>{ev.course_name}</b>: <i>{ev.title}</i>"
+                event_record = _event(key, "new_page", ev.ref)
+                if await self._send(text, [event_record]):
+                    sent_count += 1
+            elif (
+                getattr(ev, "event_type", None) == "updated_assignment"
+                and self.config.new_assignments
+            ):
+                key = f"updated_assignment:{ev.course_id}:{ev.ref}"
+                if self.repo.has_notification_event(self.user.user_id, key):
+                    continue
+                text = f"Enunciado atualizado em <b>{ev.course_name}</b>: <i>{ev.title}</i>"
+                event_record = _event(key, "updated_assignment", ev.ref)
+                if await self._send(text, [event_record]):
+                    sent_count += 1
+        return sent_count
+
     async def _send_new_announcements(self) -> int:
         rows = self.repo.list_unnotified_announcements(self.user.user_id, limit=10)
         if not rows:
@@ -381,7 +410,7 @@ class NotificationService:
             rows = self.repo.get_upcoming_assignments(
                 self.user.user_id,
                 to_utc_iso(start),
-                to_utc_iso(start + timedelta(days=2)),
+                to_utc_iso(start + timedelta(days=3)),
                 course_ids,
             )
             for row in rows:
@@ -391,7 +420,7 @@ class NotificationService:
                 if due is not None and due >= now:
                     upcoming.append(row)
 
-        lines.append("Hoje e amanhã:")
+        lines.append("Próximos 3 dias (use /tarefa para planejar):")
         if upcoming:
             for row in upcoming[:15]:
                 lines.append("- " + self._task_line(row))

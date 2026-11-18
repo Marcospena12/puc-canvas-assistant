@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 import unicodedata
 from typing import Any
@@ -8,9 +9,9 @@ from zoneinfo import ZoneInfo
 from ..config import UserProfile
 from ..repository import Repository
 from ..textutil import short_course_name
-from ..timeutil import format_date_local
+from ..timeutil import format_date_local, format_local, parse_dt
 from .file_sync import FileSyncResult
-from .search import SearchResultItem, search
+from .search import SearchResultItem, SearchResultSet, search
 
 
 def fold_text(value: str | None) -> str:
@@ -42,10 +43,19 @@ def resolve_course(
 
     for course in courses:
         full_folded = fold_text(course.get("name"))
-        short_folded = fold_text(short_course_name(course.get("name")))
+        short_name = short_course_name(course.get("name"))
+        short_folded = fold_text(short_name)
         code_folded = fold_text(course.get("course_code"))
 
-        if folded_query in (full_folded, short_folded, code_folded):
+        # Acrônimo das palavras principais (ex.: Business Intelligence -> bi, DAM, TIPI)
+        words = [
+            w
+            for w in re.split(r"[^\w]+", short_name)
+            if w and fold_text(w) not in {"de", "em", "e", "da", "do", "para", "com", "no"}
+        ]
+        acronym = "".join(w[0] for w in words).lower() if words else ""
+
+        if folded_query in (full_folded, short_folded, code_folded, acronym):
             exact_matches.append(course)
             continue
 
@@ -198,16 +208,33 @@ _LAST_SEARCH_CACHE: dict[str, tuple[float, list[SearchResultItem]]] = {}
 _CACHE_TTL_SECONDS = 900.0  # 15 minutos
 
 
-def perform_bot_search(repo: Repository, user_id: str, raw_input: str) -> str:
+def perform_bot_search(
+    repo: Repository,
+    user_id: str,
+    raw_input: str,
+    *,
+    tz: ZoneInfo | None = None,
+) -> str:
     raw_clean = (raw_input or "").strip()
     if not raw_clean:
-        return "Uso: /buscar <termo> ou /buscar <matéria>: <termo>"
+        return (
+            "Uso: /buscar <termo>, /buscar <matéria>: <termo> "
+            "ou /buscar <tipo>: <termo> (arquivo, pagina, tarefa, ementa, aviso)"
+        )
 
     target_course_id: int | None = None
+    target_source_types: list[str] | None = None
     query_text = raw_clean
 
-    if ":" in raw_clean:
-        course_part, query_part = raw_clean.split(":", 1)
+    type_prefixes = {"arquivo", "pagina", "tarefa", "ementa", "aviso"}
+    if ":" in query_text:
+        head, rest = query_text.split(":", 1)
+        if head.strip().casefold() in type_prefixes:
+            target_source_types = [head.strip().casefold()]
+            query_text = rest.strip()
+
+    if ":" in query_text:
+        course_part, query_part = query_text.split(":", 1)
         course_part = course_part.strip()
         query_part = query_part.strip()
 
@@ -232,25 +259,64 @@ def perform_bot_search(repo: Repository, user_id: str, raw_input: str) -> str:
     if not query_text:
         return "Especifique o termo de busca. Exemplo: /buscar BI: modelagem"
 
-    results = search(repo, user_id, query_text, course_id=target_course_id, k=5)
+    results = search(
+        repo,
+        user_id,
+        query_text,
+        course_id=target_course_id,
+        source_types=target_source_types,
+        k=5,
+    )
     _LAST_SEARCH_CACHE[user_id] = (time.time(), results)
 
-    return format_search_results(results, query_text)
+    return format_search_results(results, query_text, tz=tz)
 
 
-def format_search_results(results: list[SearchResultItem], query: str) -> str:
+def format_search_results(
+    results: SearchResultSet | list[SearchResultItem],
+    query: str,
+    *,
+    tz: ZoneInfo | None = None,
+) -> str:
     if not results:
         return f"Nenhum resultado encontrado para '{query}'."
 
-    lines = [f"Resultados para '{query}' ({len(results)}):"]
+    lines: list[str] = []
+    coverage = getattr(results, "coverage", "strong")
+    if coverage == "weak":
+        lines.append(
+            "não encontrei o assunto completo no material; estes são os trechos mais próximos\n"
+        )
+
+    lines.append(f"Resultados para '{query}' ({len(results)}):")
     for idx, item in enumerate(results, start=1):
         courses_str = (
             ", ".join(short_course_name(c) for c in item.associated_courses)
             if item.associated_courses
             else short_course_name(item.course_name)
         )
-        lines.append(f"\n<b>{idx}. {item.filename}</b> ({courses_str})")
-        lines.append(f"<i>Local: {item.location_label}</i>")
+        partial_info = ""
+        if getattr(item, "match_mode", "all_terms") == "partial":
+            partial_info = f" (parcial: {item.matched_terms} de {item.total_terms} termos)"
+
+        type_tags = {
+            "arquivo": "[Arquivo]",
+            "pagina": "[Página]",
+            "tarefa": "[Tarefa]",
+            "aviso": "[Aviso]",
+            "ementa": "[Ementa]",
+        }
+        stype = getattr(item, "source_type", "arquivo")
+        tag = type_tags.get(stype, "[Arquivo]")
+        due_display = None
+        if getattr(item, "due_at", None):
+            due_display = (
+                format_local(item.due_at, tz) if tz and parse_dt(item.due_at) else item.due_at
+            )
+        due_str = f" | Prazo: {due_display}" if due_display else ""
+
+        lines.append(f"\n<b>{idx}. {tag} {item.filename}</b> ({courses_str}){partial_info}")
+        lines.append(f"<i>Local: {item.location_label}{due_str}</i>")
         lines.append(f"{item.snippet}")
 
     lines.append("\nUse /trecho <n> para ver o texto completo de um resultado.")

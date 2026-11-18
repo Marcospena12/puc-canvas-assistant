@@ -7,9 +7,10 @@ import docx
 import pptx
 import pymupdf
 
-from canvas_assistant.knowledge.chunking import build_chunks
+from canvas_assistant.knowledge.chunking import MAX_SLIDES_PER_CHUNK, build_chunks
 from canvas_assistant.knowledge.extraction import ExtractionPipeline
 from canvas_assistant.knowledge.extractors import (
+    DocumentUnit,
     clean_text,
     extract_docx,
     extract_file,
@@ -259,3 +260,29 @@ def test_extraction_pipeline_incremental_and_dedupe(
     k_stats = repo.knowledge_stats(user.user_id)
     assert k_stats["status_counts"].get("extraido") == 2
     assert k_stats["total_chunks"] == 2
+
+
+def test_build_chunks_slide_ceiling_inviolable() -> None:
+    # 20 slides com pouco texto (cada um com ~50 chars < MIN_CHUNK_CHARS=200)
+    units = [
+        DocumentUnit(
+            location_type="slide",
+            index_start=i,
+            index_end=i,
+            label=f"Slide {i}",
+            text=f"Conteúdo curto do slide {i} para teste de teto.",
+        )
+        for i in range(1, 21)
+    ]
+    chunks = build_chunks(units, max_slides=MAX_SLIDES_PER_CHUNK)
+    assert len(chunks) == 4  # 6 + 6 + 6 + 2 slides
+    for chunk in chunks:
+        # Nenhum chunk pode ter mais que MAX_SLIDES_PER_CHUNK slides
+        slide_count = chunk.location_end - chunk.location_start + 1
+        assert slide_count <= MAX_SLIDES_PER_CHUNK
+        # Verifica formato do rótulo
+        assert ";" not in chunk.location_label
+    assert chunks[0].location_label == "Slides 1-6"
+    assert chunks[1].location_label == "Slides 7-12"
+    assert chunks[2].location_label == "Slides 13-18"
+    assert chunks[3].location_label == "Slides 19-20"

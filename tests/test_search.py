@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Any
 
+from canvas_assistant.knowledge.report import format_search_results
 from canvas_assistant.knowledge.search import (
+    canonical_term,
     get_neighbors,
     prepare_fts_query,
     search,
@@ -71,7 +74,27 @@ def test_stem_prefix_pt() -> None:
     assert stem_prefix_pt("tabelas") == '"tabel"*'
     assert stem_prefix_pt("tabela") == '"tabel"*'
     assert stem_prefix_pt("sql") == '"sql"'
-    assert stem_prefix_pt("fato") == '"fato"'
+    assert stem_prefix_pt("fato") == '"fato"*'
+    assert stem_prefix_pt("dado") == '"dado"*'
+
+
+def test_canonical_term_pairs() -> None:
+    pairs = [
+        ("dimensões", "dimensão"),
+        ("tabelas", "tabela"),
+        ("avaliação", "avaliações"),
+        ("funcionais", "funcional"),
+        ("requisitos", "requisito"),
+        ("dados", "dado"),
+        ("estruturas", "estrutura"),
+        ("homogêneas", "homogêneo"),
+        ("estelares", "estelar"),
+        ("professores", "professor"),
+    ]
+    for left, right in pairs:
+        assert canonical_term(left) == canonical_term(right), (left, right)
+
+    assert canonical_term("funcionais") != canonical_term("funcionando")
 
 
 def test_prepare_fts_query_cleanliness_and_hostile_inputs() -> None:
@@ -92,6 +115,45 @@ def test_prepare_fts_query_cleanliness_and_hostile_inputs() -> None:
     safe_and, _ = prepare_fts_query('("modelagem" OR NOT: *tabela*)')
     assert '"modelag"*' in safe_and
     assert '"tabel"*' in safe_and
+
+
+def test_search_rejects_prefix_false_positive(repo, user, course_factory) -> None:
+    c1 = course_factory(id=1, name="Engenharia de Software")
+    repo.upsert_courses(user.user_id, [c1])
+    seed_corpus_chunk(
+        repo,
+        user,
+        course_id=1,
+        file_id=11,
+        filename="Sistema.pdf",
+        chunk_index=1,
+        location_label="Página 1",
+        text="O sistema está funcionando corretamente em produção.",
+        sha256="sha_false_prefix",
+    )
+
+    assert search(repo, user.user_id, "funcionais") == []
+
+
+def test_search_singular_matches_plural_short_terms(repo, user, course_factory) -> None:
+    c1 = course_factory(id=1, name="Banco de Dados")
+    repo.upsert_courses(user.user_id, [c1])
+    seed_corpus_chunk(
+        repo,
+        user,
+        course_id=1,
+        file_id=12,
+        filename="Modelo.pdf",
+        chunk_index=1,
+        location_label="Página 1",
+        text="Os dados de cada fato ficam nas tabelas dimensionais.",
+        sha256="sha_short_terms",
+    )
+
+    for query in ("dado", "fato"):
+        res = search(repo, user.user_id, query)
+        assert len(res) == 1
+        assert res[0].match_mode == "all_terms"
 
 
 def test_search_accents_and_inflections(repo, user, course_factory) -> None:
@@ -347,3 +409,75 @@ def test_get_neighbors_at_file_boundaries(repo, user, course_factory) -> None:
     # No fim (último chunk): vizinho posterior não existe
     n_last = get_neighbors(repo, c3_id, before=1, after=1)
     assert [c["chunk_index"] for c in n_last] == [2, 3]
+
+
+def test_search_coverage_signals_and_partial_match(repo, user, course_factory) -> None:
+    c1 = course_factory(id=1, name="Business Intelligence")
+    repo.upsert_courses(user.user_id, [c1])
+
+    seed_corpus_chunk(
+        repo,
+        user,
+        course_id=1,
+        file_id=10,
+        filename="Aula_BI.pdf",
+        chunk_index=1,
+        location_label="Slide 1",
+        text="Conceitos de modelagem dimensional e tabelas fato no contexto de BI.",
+        sha256="sha_bi_cov",
+    )
+
+    # 1. Caso all_terms / strong coverage
+    res_strong = search(repo, user.user_id, "modelagem dimensional", k=5)
+    assert res_strong.coverage == "strong"
+    assert len(res_strong) == 1
+    assert res_strong[0].match_mode == "all_terms"
+    assert res_strong[0].matched_terms == 2
+    assert res_strong[0].total_terms == 2
+
+    # 2. Caso partial / weak coverage
+    res_weak = search(repo, user.user_id, "modelagem astronomia", k=5)
+    assert res_weak.coverage == "weak"
+    assert len(res_weak) == 1
+    assert res_weak[0].match_mode == "partial"
+    assert res_weak[0].matched_terms == 1
+    assert res_weak[0].total_terms == 2
+
+    formatted_weak = format_search_results(res_weak, "modelagem astronomia")
+    assert "não encontrei o assunto completo no material" in formatted_weak
+    assert "(parcial: 1 de 2 termos)" in formatted_weak
+
+    # 3. Caso termo inexistente / none coverage
+    res_none = search(repo, user.user_id, "telescopio espaco sideral", k=5)
+    assert res_none.coverage == "none"
+    assert len(res_none) == 0
+
+
+def test_search_snippet_is_real_excerpt(repo, user, course_factory) -> None:
+    c1 = course_factory(id=1, name="Sistemas Distribuídos")
+    repo.upsert_courses(user.user_id, [c1])
+
+    original_text = (
+        "Protocolos de consenso bizantino garantem integridade mesmo com nós falhos "
+        "e adversários maliciosos na rede distribuída."
+    )
+    seed_corpus_chunk(
+        repo,
+        user,
+        course_id=1,
+        file_id=20,
+        filename="Consenso.pdf",
+        chunk_index=1,
+        location_label="Página 4",
+        text=original_text,
+        sha256="sha_snippet_real",
+    )
+
+    results = search(repo, user.user_id, "consenso bizantino", k=5)
+    assert len(results) >= 1
+    item = results[0]
+
+    # Remove tags de destaque e elipses
+    clean_snippet = re.sub(r"</?b>", "", item.snippet).replace("...", "").strip()
+    # Verifica que o trecho do snippet está literalmente contido no texto original do chunk
+    assert clean_snippet in original_text

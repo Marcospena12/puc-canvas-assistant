@@ -5,7 +5,7 @@ from typing import Any
 
 _MD_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
 _BARE_URL_RE = re.compile(r"https?://[^\s<>\[\]]+")
-_TRAILING = ".,;:!?)]}'\""
+_TRAILING = ".,;:!?)]}'\"*"
 _RESOURCE_ID_RE = re.compile(r"/(?:assignments|files|quizzes|pages)/(\d+)")
 
 
@@ -50,3 +50,11 @@ def resource_ids_from_urls(urls: set[str]) -> set[str]:
 
 def resource_ids_from_text(text: str) -> set[str]:
     return {match.group(1) for match in _RESOURCE_ID_RE.finditer(text or "")}
+
+
+def is_canvas_url(url: str, base_url: str = "") -> bool:
+    if not url:
+        return False
+    if base_url and url.startswith(base_url.rstrip("/")):
+        return True
+    return "instructure.com" in url or "canvas" in url

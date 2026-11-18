@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from pathlib import Path
 
 import httpx
 
 from .agent import Agent
 from .app import SyncRunner, build_status_text, format_sync_result, run_bot
+from .backup import check_backup, create_backup, latest_backup
 from .canvas import CanvasClient, CanvasService
 from .config import Settings
 from .db import Database
+from .knowledge.content_sync import ContentSyncService
 from .knowledge.downloader import FileDownloader
 from .knowledge.extraction import ExtractionPipeline
 from .knowledge.file_sync import FileSyncService
@@ -20,10 +23,25 @@ from .knowledge.report import (
     resolve_course,
 )
 from .knowledge.search import search
-from .llm import create_provider
+from .knowledge.study_service import (
+    explain_topic,
+    generate_quiz,
+    get_quiz_answer_key,
+    get_usage_report,
+    summarize_file,
+)
+from .knowledge.task_briefing import (
+    format_refusal_message,
+    generate_task_briefing,
+    is_resolution_request,
+    list_pending_tasks_text,
+    resolve_task_selection,
+)
+from .llm import create_provider, create_study_provider
 from .logging_setup import setup_logging
 from .repository import Repository
 from .sync import SyncService
+from .textutil import short_course_name
 from .timeutil import get_timezone
 
 
@@ -179,9 +197,16 @@ def _reindex(settings: Settings) -> None:
     print(f"Reindexação FTS5 concluída: {indexed} chunks indexados (total na base: {total}).")
 
 
-def _cli_search(settings: Settings, query: str, course_query: str | None, k: int) -> None:
+def _cli_search(
+    settings: Settings,
+    query: str,
+    course_query: str | None,
+    k: int,
+    source_type: str | None = None,
+) -> None:
     user = settings.user
     repo = _make_repo(settings)
+    tz = get_timezone(settings.timezone)
 
     target_course_id: int | None = None
     if course_query:
@@ -201,8 +226,46 @@ def _cli_search(settings: Settings, query: str, course_query: str | None, k: int
             return
         target_course_id = int(matched["id"])
 
-    results = search(repo, user.user_id, query, course_id=target_course_id, k=k)
-    print(format_search_results(results, query))
+    s_types = [source_type] if source_type else None
+    results = search(
+        repo,
+        user.user_id,
+        query,
+        course_id=target_course_id,
+        source_types=s_types,
+        k=k,
+    )
+    print(format_search_results(results, query, tz=tz))
+
+
+async def _sync_content(settings: Settings, *, force_all: bool = False) -> None:
+    user = settings.user
+    repo = _make_repo(settings)
+    tz = get_timezone(settings.timezone)
+    if force_all:
+        repo.clear_content_retries(user.user_id)
+    async with httpx.AsyncClient(timeout=settings.file_download_timeout_seconds) as http:
+        client = CanvasClient(http, user.canvas_base_url, user.canvas_token)
+        service = CanvasService(client)
+        content_sync = ContentSyncService(
+            repo,
+            service,
+            user,
+            tz,
+            blocked_retry_hours=settings.content_blocked_retry_hours,
+        )
+        res = await content_sync.sync_all(notify_baseline=False, force=force_all)
+        print("Sincronização de conteúdo concluída:")
+        print(f"- Páginas ingeridas: {res.pages_ingested}")
+        print(f"- Tarefas ingeridas: {res.assignments_ingested}")
+        print(f"- Avisos ingeridos: {res.announcements_ingested}")
+        print(f"- Ementas ingeridas: {res.syllabus_ingested}")
+        print(f"- Quizzes ingeridos: {res.quizzes_ingested}")
+        print(f"- Total de chunks criados: {res.chunks_created}")
+        if res.errors:
+            print("Erros:")
+            for err in res.errors:
+                print(f"  • {err}")
 
 
 async def _ask(settings: Settings, question: str) -> None:
@@ -241,6 +304,133 @@ def _status(settings: Settings) -> None:
     print(build_status_text(repo, settings))
 
 
+def _backup(settings: Settings, keep: int) -> int:
+    result = create_backup(
+        settings.db_path,
+        settings.db_path.parent / "backups",
+        keep=keep,
+    )
+    status = "OK" if result.integrity_ok else "FALHOU"
+    print(f"Backup: {result.path} ({result.size_bytes} bytes, integrity={status})")
+    if result.removed:
+        print(f"Backups antigos removidos: {result.removed}")
+    return 0 if result.integrity_ok else 1
+
+
+def _backup_check(settings: Settings, path: str | None) -> int:
+    backup_dir = settings.db_path.parent / "backups"
+    target = Path(path) if path else latest_backup(backup_dir)
+    if target is None:
+        print(f"Nenhum backup encontrado em {backup_dir}")
+        return 1
+    ok = check_backup(target)
+    print(f"Backup: {target} | integrity={'ok' if ok else 'FALHOU'}")
+    return 0 if ok else 1
+
+
+async def _cli_study_explain(settings: Settings, topic: str, course: str | None) -> None:
+    repo = _make_repo(settings)
+    provider = create_study_provider(settings)
+    try:
+        res = await explain_topic(
+            repo, provider, settings.user, topic, course_query=course, settings=settings
+        )
+        print(res.text)
+        print(
+            f"\n[Estatísticas: {res.context_blocks} blocos | "
+            f"{res.input_tokens} in / {res.output_tokens} out tokens | {res.latency_ms}ms]"
+        )
+    finally:
+        await provider.aclose()
+
+
+async def _cli_study_summary(
+    settings: Settings, course: str, file_query: str, location_range: str | None
+) -> None:
+    repo = _make_repo(settings)
+    provider = create_study_provider(settings)
+    try:
+        res = await summarize_file(
+            repo, provider, settings.user, course, file_query, location_range, settings=settings
+        )
+        print(res.text)
+        print(
+            f"\n[Estatísticas: {res.context_blocks} blocos | "
+            f"{res.input_tokens} in / {res.output_tokens} out tokens | "
+            f"{res.latency_ms}ms | cache={res.from_cache}]"
+        )
+    finally:
+        await provider.aclose()
+
+
+async def _cli_study_quiz(settings: Settings, course: str, topic: str, n: int) -> None:
+    repo = _make_repo(settings)
+    provider = create_study_provider(settings)
+    try:
+        quiz_data, res = await generate_quiz(
+            repo, provider, settings.user, course, topic, n=n, settings=settings
+        )
+        print(res.text)
+        if quiz_data:
+            print(
+                f"\n[Estatísticas: {res.context_blocks} blocos | "
+                f"{res.input_tokens} in / {res.output_tokens} out tokens | {res.latency_ms}ms]"
+            )
+            ans = get_quiz_answer_key(settings.user.user_id)
+            print("\n" + "=" * 50)
+            print(ans)
+    finally:
+        await provider.aclose()
+
+
+def _cli_study_usage(settings: Settings) -> None:
+    repo = _make_repo(settings)
+    print(get_usage_report(repo, settings.user.user_id))
+
+
+def _cli_study_tasks(settings: Settings, course: str | None) -> None:
+    repo = _make_repo(settings)
+    tz = get_timezone(settings.timezone)
+    print(list_pending_tasks_text(repo, settings.user.user_id, tz, course_query=course or ""))
+
+
+async def _cli_study_task(settings: Settings, query: str) -> None:
+    repo = _make_repo(settings)
+    tz = get_timezone(settings.timezone)
+    assignment, candidates, err = resolve_task_selection(repo, settings.user.user_id, query, tz)
+    if err:
+        print(err)
+        return
+    if candidates:
+        print(f"Mais de uma tarefa corresponde a '{query}':")
+        for c in candidates:
+            cname = short_course_name(c.get("course_name"))
+            print(f"- {c.get('name')} ({cname})")
+        print("Especifique pelo número de /tarefas ou título mais exato.")
+        return
+    if not assignment:
+        print(f"Tarefa '{query}' não encontrada.")
+        return
+    if is_resolution_request(query):
+        cname = short_course_name(assignment.get("course_name"))
+        print(format_refusal_message(assignment.get("name") or "", cname))
+        return
+
+    provider = create_study_provider(settings)
+    try:
+        res = await generate_task_briefing(
+            repo, provider, settings.user, assignment, tz, settings=settings
+        )
+        print(res.text)
+        print(
+            f"\n[Estatísticas: {res.context_blocks} blocos | "
+            f"{res.input_tokens} in / {res.output_tokens} out tokens | {res.latency_ms}ms"
+            f"{' (do cache)' if res.from_cache else ''}]"
+        )
+    finally:
+        await provider.aclose()
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="canvas-assistant")
     sub = parser.add_subparsers(dest="command")
@@ -249,6 +439,14 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("check", help="valida configuração, Canvas e modelo local")
     sub.add_parser("sync", help="sincroniza o Canvas com o cache local")
     sub.add_parser("sync-files", help="sincroniza e baixa arquivos das matérias ativas")
+    sync_content_parser = sub.add_parser(
+        "sync-content", help="sincroniza páginas, tarefas, avisos e ementas"
+    )
+    sync_content_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="reprocessa todo o conteúdo, ignorando hashes e bloqueios temporários",
+    )
     files_parser = sub.add_parser("files", help="lista arquivos conhecidos de uma matéria")
     files_parser.add_argument("query", nargs="*", help="nome da matéria ou parte dele (opcional)")
     extract_parser = sub.add_parser("extract", help="extrai texto dos arquivos baixados")
@@ -263,15 +461,51 @@ def main(argv: list[str] | None = None) -> None:
     search_parser.add_argument("query", help="termo ou frase de busca")
     search_parser.add_argument("--course", help="filtra por matéria (opcional)")
     search_parser.add_argument(
+        "--type",
+        choices=["arquivo", "pagina", "tarefa", "ementa", "aviso"],
+        help="filtra por tipo de conteúdo",
+    )
+    search_parser.add_argument(
         "-k", type=int, default=8, help="número máximo de resultados (padrão: 8)"
     )
     ask_parser = sub.add_parser("ask", help="faz uma pergunta ao agente pelo terminal")
     ask_parser.add_argument("question", nargs="+", help="pergunta em linguagem natural")
     sub.add_parser("status", help="mostra o estado do cache")
+    backup_parser = sub.add_parser("backup", help="cria backup consistente do banco")
+    backup_parser.add_argument("--keep", type=int, default=7, help="backups a manter (padrão: 7)")
+    backup_check_parser = sub.add_parser("backup-check", help="verifica integridade de um backup")
+    backup_check_parser.add_argument("--path", help="arquivo de backup (padrão: mais recente)")
+
+    study_parser = sub.add_parser("study", help="ferramentas de estudo com LLM")
+    study_sub = study_parser.add_subparsers(dest="study_command")
+
+    sp_explain = study_sub.add_parser("explain", help="explica um tópico acadêmico com fontes")
+    sp_explain.add_argument("topic", nargs="+", help="tópico ou dúvida")
+    sp_explain.add_argument("--course", help="filtra por matéria (opcional)")
+
+    sp_summary = study_sub.add_parser("summary", help="resumo estruturado de um arquivo de aula")
+    sp_summary.add_argument("course", help="nome ou código da matéria")
+    sp_summary.add_argument("file", help="nome ou trecho do arquivo")
+    sp_summary.add_argument(
+        "range", nargs="?", default=None, help="faixa de páginas/slides (opcional)"
+    )
+
+    sp_quiz = study_sub.add_parser("quiz", help="gera quiz formativo sobre um tópico")
+    sp_quiz.add_argument("course", help="nome ou código da matéria")
+    sp_quiz.add_argument("topic", help="tópico do quiz")
+    sp_quiz.add_argument("-n", type=int, default=5, help="número de questões (padrão 5)")
+
+    study_sub.add_parser("usage", help="relatório de consumo de tokens dos últimos 7 dias")
+
+    sp_tasks = study_sub.add_parser("tasks", help="lista tarefas pendentes por prazo")
+    sp_tasks.add_argument("--course", help="filtra por matéria (opcional)")
+
+    sp_task = study_sub.add_parser("task", help="briefing estruturado de uma tarefa")
+    sp_task.add_argument("query", nargs="+", help="número de /tarefas ou título da tarefa")
 
     args = parser.parse_args(argv)
     settings = Settings()
-    setup_logging(settings.log_level)
+    setup_logging(settings.log_level, log_file=Path("data/logs/assistant.log"))
 
     if args.command in (None, "run"):
         try:
@@ -292,6 +526,12 @@ def main(argv: list[str] | None = None) -> None:
         except Exception as exc:
             print(f"Falha na sincronização de arquivos: {exc}")
             raise SystemExit(1) from exc
+    elif args.command == "sync-content":
+        try:
+            asyncio.run(_sync_content(settings, force_all=bool(args.all)))
+        except Exception as exc:
+            print(f"Falha na sincronização de conteúdo: {exc}")
+            raise SystemExit(1) from exc
     elif args.command == "files":
         query = " ".join(args.query) if args.query else ""
         _files(settings, query)
@@ -302,11 +542,32 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "reindex":
         _reindex(settings)
     elif args.command == "search":
-        _cli_search(settings, args.query, args.course, args.k)
+        _cli_search(settings, args.query, args.course, args.k, getattr(args, "type", None))
     elif args.command == "ask":
         question = " ".join(args.question)
         asyncio.run(_ask(settings, question))
     elif args.command == "status":
         _status(settings)
+    elif args.command == "backup":
+        raise SystemExit(_backup(settings, max(1, args.keep)))
+    elif args.command == "backup-check":
+        raise SystemExit(_backup_check(settings, args.path))
+    elif args.command == "study":
+        if args.study_command == "explain":
+            topic_str = " ".join(args.topic)
+            asyncio.run(_cli_study_explain(settings, topic_str, args.course))
+        elif args.study_command == "summary":
+            asyncio.run(_cli_study_summary(settings, args.course, args.file, args.range))
+        elif args.study_command == "quiz":
+            asyncio.run(_cli_study_quiz(settings, args.course, args.topic, args.n))
+        elif args.study_command == "usage":
+            _cli_study_usage(settings)
+        elif args.study_command == "tasks":
+            _cli_study_tasks(settings, args.course)
+        elif args.study_command == "task":
+            query_str = " ".join(args.query)
+            asyncio.run(_cli_study_task(settings, query_str))
+        else:
+            study_parser.print_help()
     else:
         parser.print_help()

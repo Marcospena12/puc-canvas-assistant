@@ -29,6 +29,14 @@ def to_utc_iso(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
 
+def to_local_iso(value: str | datetime | None, tz: ZoneInfo) -> str | None:
+    """Serializa uma data em ISO 8601 com offset do fuso local e ano explícito."""
+    dt = parse_dt(value) if isinstance(value, str) or value is None else value
+    if dt is None:
+        return None
+    return dt.astimezone(tz).isoformat(timespec="seconds")
+
+
 def local_now(tz: ZoneInfo) -> datetime:
     return datetime.now(UTC).astimezone(tz)
 

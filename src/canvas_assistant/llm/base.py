@@ -43,6 +43,12 @@ class Message:
 class LLMResponse:
     text: str
     tool_calls: list[ToolCall] = field(default_factory=list)
+    input_tokens: int = 0
+    output_tokens: int = 0
+    load_duration_ms: int = 0
+    prompt_eval_duration_ms: int = 0
+    eval_duration_ms: int = 0
+    thinking_chars: int = 0
 
 
 class LLMProvider(Protocol):

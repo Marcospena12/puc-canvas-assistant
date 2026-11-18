@@ -36,7 +36,7 @@ class CanvasService:
     async def get_assignments(self, course_id: int) -> list[dict[str, Any]]:
         return await self.client.get_all(
             f"/courses/{course_id}/assignments",
-            {"include[]": ["submission"]},
+            {"include[]": ["submission", "rubric"]},
         )
 
     async def get_announcements(
